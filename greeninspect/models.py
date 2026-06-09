@@ -89,3 +89,33 @@ class Task:
     status: str = TaskStatus.PENDING.value
     completed_at: Optional[str] = None
     created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+
+@dataclass
+class Shift:
+    id: Optional[int] = None
+    shift_no: str = ""
+    name: str = ""
+    leader: str = ""
+    members: str = ""
+    start_time: str = ""
+    end_time: Optional[str] = None
+    status: str = "进行中"
+    created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+
+@dataclass
+class ShiftHandover:
+    id: Optional[int] = None
+    shift_id: int = 0
+    shift_no: str = ""
+    handover_from: str = ""
+    handover_to: str = ""
+    handover_time: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    pending_task_ids: str = ""
+    abnormal_plant_codes: str = ""
+    unfinished_reason: str = ""
+    remarks: str = ""
+    confirmed: int = 0
+    confirmed_at: Optional[str] = None
+    created_at: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))

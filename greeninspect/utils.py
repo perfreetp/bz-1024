@@ -311,3 +311,62 @@ def days_between(d1: str, d2: Optional[str] = None) -> int:
         return (date2 - date1).days
     except Exception:
         return 0
+
+
+from .models import Shift, ShiftHandover
+
+
+def print_shifts_table(shifts: List[Shift], title: str = "班次列表"):
+    if not shifts:
+        console.print(Panel("[yellow]暂无班次记录[/yellow]", title=title, border_style="yellow"))
+        return
+
+    table = Table(title=title, box=box.ROUNDED)
+    table.add_column("班次号", style="cyan", no_wrap=True)
+    table.add_column("班次名称", style="green")
+    table.add_column("负责人", style="magenta")
+    table.add_column("成员", style="white")
+    table.add_column("开始时间", style="yellow")
+    table.add_column("结束时间", style="yellow")
+    table.add_column("状态", style="bold")
+
+    for s in shifts:
+        status_style = "bold green" if s.status == "进行中" else "bold white"
+        table.add_row(
+            s.shift_no, s.name or "-", s.leader or "-",
+            (s.members or "-")[:20],
+            s.start_time or "-", s.end_time or "-",
+            f"[{status_style}]{s.status}[/{status_style}]"
+        )
+    console.print(table)
+
+
+def print_handovers_table(handovers: List[ShiftHandover], title: str = "交接班记录"):
+    if not handovers:
+        console.print(Panel("[yellow]暂无交接班记录[/yellow]", title=title, border_style="yellow"))
+        return
+
+    table = Table(title=title, box=box.ROUNDED)
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("班次号", style="blue")
+    table.add_column("交班人", style="magenta")
+    table.add_column("接班人", style="green")
+    table.add_column("交接时间", style="yellow")
+    table.add_column("遗留任务", justify="right")
+    table.add_column("异常植株", justify="right")
+    table.add_column("确认状态", style="bold")
+
+    for h in handovers:
+        pending_cnt = len([x for x in h.pending_task_ids.split(",") if x.strip()]) if h.pending_task_ids else 0
+        abnormal_cnt = len([x for x in h.abnormal_plant_codes.split(",") if x.strip()]) if h.abnormal_plant_codes else 0
+        if h.confirmed:
+            status = f"[bold green]✓已确认 ({h.confirmed_at or ''})[/bold green]"
+        else:
+            status = f"[bold yellow]⏳待确认[/bold yellow]"
+        table.add_row(
+            str(h.id), h.shift_no or "-", h.handover_from or "-",
+            h.handover_to or "[dim]未指定[/dim]",
+            h.handover_time or "-",
+            str(pending_cnt), str(abnormal_cnt), status
+        )
+    console.print(table)

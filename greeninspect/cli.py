@@ -12,11 +12,12 @@ from rich.prompt import Prompt, Confirm, IntPrompt
 from rich import print as rprint
 
 from .storage import Storage, DEFAULT_DB_PATH
-from .models import Plant, Inspection, Photo, Task, PlantStatus, TaskType, TaskStatus
+from .models import Plant, Inspection, Photo, Task, PlantStatus, TaskType, TaskStatus, Shift, ShiftHandover
 from .utils import (
     console, import_plants_from_csv, print_plants_table, print_inspections_table,
     print_tasks_table, print_photos_table, determine_plant_status,
     generate_tasks_from_inspection, parse_date, days_between,
+    print_shifts_table, print_handovers_table,
 )
 
 app = typer.Typer(
@@ -605,7 +606,7 @@ def task_cmd(
 # ============================================================
 # report 命令
 # ============================================================
-@app.command("report", help="汇总报告:按日期汇总、异常摘要、打印交接清单")
+@app.command("report", help="汇总报告:按日期汇总、异常摘要、区域负责人视角、连续异常、交接清单")
 def report_cmd(
     date_from: str = typer.Option("", "--from", "-f", help="开始日期 YYYY-MM-DD"),
     date_to: str = typer.Option("", "--to", "-t", help="结束日期 YYYY-MM-DD"),
@@ -615,6 +616,10 @@ def report_cmd(
     area: str = typer.Option("", "--area", "-a", help="按区域筛选"),
     summary: bool = typer.Option(False, "--summary", "-s", help="生成异常摘要"),
     handover: bool = typer.Option(False, "--handover", "-h", help="打印交接班清单"),
+    area_view: bool = typer.Option(False, "--area-view", help="区域负责人视角:按区域+责任人+任务状态汇总"),
+    abnormal_view: bool = typer.Option(False, "--abnormal", help="连续多天异常植株和重复问题分析"),
+    abnormal_days: int = typer.Option(7, "--abnormal-days", help="连续异常分析的时间窗口(天)"),
+    min_occurrences: int = typer.Option(2, "--min-occur", help="最小异常出现次数才算连续"),
     db_path: str = typer.Option("", "--db", help="自定义数据库路径"),
 ):
     """巡检报告汇总"""
@@ -645,6 +650,16 @@ def report_cmd(
         raise typer.Exit(1)
 
     insps = storage.get_inspections_by_area_and_date(area, df, dt)
+
+    # 新增：区域负责人视角
+    if area_view:
+        _print_area_leader_view(storage, df, dt, area)
+        return
+
+    # 新增：连续异常植株 + 重复问题
+    if abnormal_view:
+        _print_abnormal_trend_view(storage, abnormal_days, min_occurrences, area)
+        return
 
     if handover:
         _print_handover_report(storage, df, dt, area)
@@ -826,9 +841,223 @@ def _print_handover_report(storage: Storage, df: str, dt: str, area: str):
 
 
 # ============================================================
+# 区域负责人视角
+# ============================================================
+def _print_area_leader_view(storage: Storage, df: str, dt: str, area_filter: str):
+    """按区域、责任人、任务状态汇总展示"""
+    from collections import defaultdict
+    from rich.table import Table as T
+    from rich import box
+
+    console.print(Panel(
+        f"[bold cyan]时间范围:[/bold cyan] {df} ~ {dt}\n"
+        f"[bold cyan]区域:[/bold cyan] {area_filter or '全部'}",
+        title="区域负责人视角汇总", border_style="green", expand=False
+    ))
+
+    # 1. 按区域 x 责任人 x 状态 汇总任务
+    tasks = storage.get_tasks()
+    if area_filter:
+        tasks = [t for t in tasks if t.area == area_filter]
+
+    # 过滤日期范围内创建的任务（或者所有未完成的+已完成）
+    # 这里取全部任务展示
+    matrix = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+    for t in tasks:
+        area = t.area or "未分区域"
+        assignee = t.assignee or "未指派"
+        matrix[area][assignee][t.status] += 1
+        matrix[area][assignee]["合计"] += 1
+
+    if matrix:
+        t1 = T(title="任务矩阵: 区域 × 责任人 × 状态", box=box.ROUNDED)
+        t1.add_column("区域", style="cyan", no_wrap=True)
+        t1.add_column("责任人", style="magenta")
+        t1.add_column("待处理", justify="right", style="yellow")
+        t1.add_column("处理中", justify="right", style="blue")
+        t1.add_column("已逾期", justify="right", style="bold red")
+        t1.add_column("已完成", justify="right", style="green")
+        t1.add_column("总计", justify="right", style="bold")
+
+        for area in sorted(matrix.keys()):
+            for assignee in sorted(matrix[area].keys()):
+                d = matrix[area][assignee]
+                t1.add_row(
+                    area, assignee,
+                    str(d.get("待处理", 0)),
+                    str(d.get("处理中", 0)),
+                    f"[bold red]{d.get('已逾期', 0)}[/bold red]",
+                    str(d.get("已完成", 0)),
+                    f"[bold]{d.get('合计', 0)}[/bold]"
+                )
+                area = ""  # 合并区域列显示
+        console.print(t1)
+
+    # 2. 责任人绩效概览（按责任人汇总）
+    perf = defaultdict(lambda: {"总任务": 0, "已完成": 0, "待处理": 0, "逾期": 0})
+    for t in tasks:
+        a = t.assignee or "未指派"
+        perf[a]["总任务"] += 1
+        if t.status == TaskStatus.COMPLETED.value:
+            perf[a]["已完成"] += 1
+        elif t.status == TaskStatus.OVERDUE.value:
+            perf[a]["逾期"] += 1
+        else:
+            perf[a]["待处理"] += 1
+
+    if perf:
+        t2 = T(title="责任人绩效(全部任务)", box=box.ROUNDED)
+        t2.add_column("责任人", style="green")
+        t2.add_column("总任务", justify="right")
+        t2.add_column("已完成", justify="right", style="green")
+        t2.add_column("待处理", justify="right", style="yellow")
+        t2.add_column("已逾期", justify="right", style="bold red")
+        t2.add_column("完成率", justify="right", style="bold")
+        for a in sorted(perf.keys(), key=lambda x: -perf[x]["总任务"]):
+            p = perf[a]
+            rate = round(p["已完成"] / p["总任务"] * 100, 1) if p["总任务"] else 0
+            rate_style = "green" if rate >= 80 else ("yellow" if rate >= 50 else "red")
+            t2.add_row(a, str(p["总任务"]), str(p["已完成"]), str(p["待处理"]),
+                       f"[bold red]{p['逾期']}[/bold red]",
+                       f"[{rate_style}]{rate}%[/{rate_style}]")
+        console.print(t2)
+
+    # 3. 各区域健康度（巡检平均评分 + 植株状态分布）
+    inspections = storage.get_inspections_by_area_and_date(area_filter or "", df, dt)
+    by_area = defaultdict(list)
+    for i in inspections:
+        by_area[i.area or "未分区域"].append(i)
+
+    all_plants = storage.search_plants(area=area_filter)
+    status_by_area = defaultdict(lambda: defaultdict(int))
+    for p in all_plants:
+        status_by_area[p.area or "未分区域"][p.status] += 1
+
+    t3 = T(title="区域健康度一览", box=box.ROUNDED)
+    t3.add_column("区域", style="cyan")
+    t3.add_column("巡检次数", justify="right")
+    t3.add_column("覆盖植株", justify="right")
+    t3.add_column("平均评分", justify="right")
+    t3.add_column("健康株", justify="right", style="green")
+    t3.add_column("异常株", justify="right", style="red")
+    t3.add_column("逾期株", justify="right", style="bold red")
+
+    areas = sorted(set(list(by_area.keys()) + list(status_by_area.keys())))
+    for ar in areas:
+        lst = by_area.get(ar, [])
+        score = round(sum(i.health_score for i in lst) / len(lst), 1) if lst else "-"
+        score_style = ""
+        if isinstance(score, float):
+            score_style = "green" if score >= 80 else ("yellow" if score >= 60 else "red")
+            score = f"[{score_style}]{score}[/{score_style}]"
+        statuses = status_by_area.get(ar, {})
+        healthy = statuses.get("健康", 0)
+        total_area = sum(statuses.values())
+        abnormal = total_area - healthy
+        overdue_ar = len(storage.get_overdue_plants(ar))
+        t3.add_row(ar, str(len(lst)), str(len(set(i.plant_code for i in lst))),
+                   str(score), str(healthy), f"[red]{abnormal}[/red]",
+                   f"[bold red]{overdue_ar}[/bold red]")
+    console.print(t3)
+
+
+# ============================================================
+# 连续异常 & 重复问题分析视角
+# ============================================================
+def _print_abnormal_trend_view(storage: Storage, days: int, min_occur: int, area_filter: str):
+    """展示连续多日异常植株和重复问题"""
+    from collections import defaultdict
+    from rich.table import Table as T
+    from rich import box
+
+    console.print(Panel(
+        f"分析窗口: 最近 [bold yellow]{days}[/bold yellow] 天\n"
+        f"判定阈值: 异常次数 ≥ [bold yellow]{min_occur}[/bold yellow] 次\n"
+        f"区域筛选: {area_filter or '全部'}",
+        title="连续异常植株 & 重复问题分析", border_style="red", expand=False
+    ))
+
+    # 1. 连续异常植株
+    consec = storage.get_consecutive_abnormal_plants(days=days, min_occurrences=min_occur)
+    if area_filter:
+        consec = [c for c in consec if c["area"] == area_filter]
+
+    if consec:
+        t1 = T(title=f"反复出现异常的植株 ({len(consec)}株，建议重点养护)", box=box.ROUNDED)
+        t1.add_column("编号", style="cyan", no_wrap=True)
+        t1.add_column("名称", style="green")
+        t1.add_column("区域", style="blue")
+        t1.add_column("异常次数", justify="right", style="bold red")
+        t1.add_column("首次异常", style="yellow")
+        t1.add_column("最近异常", style="yellow")
+        t1.add_column("平均评分", justify="right")
+        t1.add_column("主要问题", style="magenta")
+        t1.add_column("问题明细", style="white")
+        for c in consec:
+            sc_style = "red" if c["avg_score"] < 60 else ("yellow" if c["avg_score"] < 80 else "white")
+            t1.add_row(
+                c["plant_code"], c["plant_name"] or "-", c["area"] or "-",
+                f"[bold red]{c['abnormal_days']}[/bold red]",
+                c["first_date"], c["last_date"],
+                f"[{sc_style}]{c['avg_score']}[/{sc_style}]",
+                f"[bold]{c['top_issue']}[/bold]",
+                c["issue_detail"] or "-"
+            )
+        console.print(t1)
+    else:
+        console.print(Panel("[green]✓ 未发现反复异常的植株，养护状况良好[/green]",
+                              title="连续异常排查", border_style="green"))
+
+    # 2. 重复问题统计（按区域+责任人+任务类型）
+    repeat = storage.get_repeat_issue_summary(days=days)
+    if area_filter:
+        repeat = [r for r in repeat if r["area"] == area_filter]
+
+    if repeat:
+        t2 = T(title=f"重复问题排行 TOP（按任务数）", box=box.ROUNDED)
+        t2.add_column("排名", justify="right", style="cyan")
+        t2.add_column("区域", style="blue")
+        t2.add_column("责任人", style="green")
+        t2.add_column("问题类型", style="magenta")
+        t2.add_column("总次数", justify="right")
+        t2.add_column("已完成", justify="right", style="green")
+        t2.add_column("待处理", justify="right", style="yellow")
+        t2.add_column("已逾期", justify="right", style="bold red")
+        t2.add_column("完成率", justify="right")
+        for idx, r in enumerate(repeat[:15], 1):
+            rate_style = "green" if r["done_rate"] >= 80 else ("yellow" if r["done_rate"] >= 50 else "red")
+            t2.add_row(
+                str(idx), r["area"], r["assignee"], r["task_type"],
+                str(r["total"]), str(r["done"]), str(r["pending"]),
+                f"[bold red]{r['overdue']}[/bold red]",
+                f"[{rate_style}]{r['done_rate']}%[/{rate_style}]"
+            )
+        console.print(t2)
+
+    # 3. 根因分析建议
+    if consec or repeat:
+        suggestions = []
+        if any(c["top_issue"] == "缺水" for c in consec):
+            suggestions.append("💧 部分植株反复缺水，建议优化浇水排班或增加自动灌溉装置")
+        if any(c["top_issue"] == "虫害" for c in consec):
+            suggestions.append("🐛 反复出现虫害，建议开展区域统一消杀，清理病枝病叶")
+        if any(c["top_issue"] == "枯黄" for c in consec):
+            suggestions.append("🍂 多次枯黄，建议检查土壤肥力、排水和光照条件")
+        if any(c["top_issue"] == "需修剪" for c in consec):
+            suggestions.append("✂️ 修剪需求频繁，建议缩短该区域修剪周期")
+        low_perf = [r for r in repeat if r["done_rate"] < 60 and r["overdue"] > 0]
+        if low_perf:
+            names = ", ".join(set(r["assignee"] for r in low_perf))
+            suggestions.append(f"👥 以下责任人任务积压较多: {names}，建议增派支援或重新分配")
+        if suggestions:
+            console.print(Panel("\n".join(f"  • {s}" for s in suggestions),
+                                  title="📋 养护优化建议", border_style="yellow"))
+
+
+# ============================================================
 # export 命令
 # ============================================================
-@app.command("export", help="导出巡检表(Excel/CSV)、任务清单、植株档案")
+@app.command("export", help="导出巡检表(Excel/CSV)、任务清单、植株档案、汇总分析")
 def export_cmd(
     output: str = typer.Option("巡检导出.xlsx", "--output", "-o", help="输出文件路径(.xlsx/.csv)"),
     date_from: str = typer.Option("", "--from", "-f", help="开始日期 YYYY-MM-DD"),
@@ -837,10 +1066,12 @@ def export_cmd(
     week: bool = typer.Option(False, "--week", help="最近7天"),
     data_type: str = typer.Option(
         "inspections", "--type",
-        help="导出类型: inspections(巡检记录)/tasks(任务)/plants(植株档案)/all(全部)"
+        help="导出类型: inspections/tasks/plants/all(含汇总)"
     ),
     area: str = typer.Option("", "--area", "-a", help="按区域筛选"),
     status: str = typer.Option("", "--status", "-s", help="按状态筛选"),
+    with_summary: bool = typer.Option(True, "--summary/--no-summary", help="是否包含汇总Sheet(仅.xlsx)"),
+    abnormal_days: int = typer.Option(14, "--abnormal-days", help="连续异常分析的时间窗口(天)"),
     db_path: str = typer.Option("", "--db", help="自定义数据库路径"),
 ):
     """导出数据到 Excel 或 CSV"""
@@ -930,6 +1161,104 @@ def export_cmd(
             })
         sheets["植株档案"] = pd.DataFrame(rows)
 
+    # 汇总分析Sheet (仅 xlsx, data_type=all 或 with_summary=True)
+    if with_summary and ext != ".csv":
+        try:
+            # Sheet1: 任务矩阵 区域x责任人x状态
+            from collections import defaultdict
+            tasks = storage.get_tasks()
+            if area:
+                tasks = [t for t in tasks if t.area == area]
+            matrix = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+            for t in tasks:
+                ar = t.area or "未分区域"
+                u = t.assignee or "未指派"
+                matrix[ar][u][t.status] += 1
+                matrix[ar][u]["合计"] += 1
+
+            m_rows = []
+            for ar in sorted(matrix.keys()):
+                for u in sorted(matrix[ar].keys()):
+                    d = matrix[ar][u]
+                    rate = round(d.get("已完成", 0) / d.get("合计", 1) * 100, 1)
+                    m_rows.append({
+                        "区域": ar, "责任人": u,
+                        "待处理": d.get("待处理", 0),
+                        "处理中": d.get("处理中", 0),
+                        "已逾期": d.get("已逾期", 0),
+                        "已完成": d.get("已完成", 0),
+                        "合计": d.get("合计", 0),
+                        "完成率%": rate,
+                    })
+            if m_rows:
+                sheets["区域责任人任务汇总"] = pd.DataFrame(m_rows)
+
+            # Sheet2: 连续异常植株
+            consec = storage.get_consecutive_abnormal_plants(days=abnormal_days, min_occurrences=2)
+            if area:
+                consec = [c for c in consec if c["area"] == area]
+            if consec:
+                sheets["连续异常植株"] = pd.DataFrame(consec)
+
+            # Sheet3: 重复问题类型排行
+            repeat = storage.get_repeat_issue_summary(days=abnormal_days)
+            if area:
+                repeat = [r for r in repeat if r["area"] == area]
+            if repeat:
+                sheets["重复问题排行"] = pd.DataFrame(repeat)
+
+            # Sheet4: 各区域健康度
+            insps2 = storage.get_inspections_by_area_and_date(area or "", date_from, date_to)
+            by_area2 = defaultdict(list)
+            for i in insps2:
+                by_area2[i.area or "未分区域"].append(i)
+            all_p = storage.search_plants(area=area)
+            st_area = defaultdict(lambda: defaultdict(int))
+            for p in all_p:
+                st_area[p.area or "未分区域"][p.status] += 1
+            health_rows = []
+            for ar in sorted(set(list(by_area2.keys()) + list(st_area.keys()))):
+                lst = by_area2.get(ar, [])
+                avg = round(sum(i.health_score for i in lst) / len(lst), 1) if lst else None
+                sts = st_area.get(ar, {})
+                total_ar = sum(sts.values())
+                ov = len(storage.get_overdue_plants(ar))
+                health_rows.append({
+                    "区域": ar,
+                    "巡检次数": len(lst),
+                    "覆盖植株": len(set(i.plant_code for i in lst)),
+                    "平均评分": avg,
+                    "健康株": sts.get("健康", 0),
+                    "异常株": total_ar - sts.get("健康", 0),
+                    "逾期未检": ov,
+                    "植株总数": total_ar,
+                })
+            if health_rows:
+                sheets["区域健康度汇总"] = pd.DataFrame(health_rows)
+
+            # Sheet5: 交接班记录摘要
+            handovers = storage.get_handovers(limit=100)
+            if handovers:
+                ho_rows = []
+                for h in handovers:
+                    pending_cnt = len([x for x in h.pending_task_ids.split(",") if x.strip()]) if h.pending_task_ids else 0
+                    abn_cnt = len([x for x in h.abnormal_plant_codes.split(",") if x.strip()]) if h.abnormal_plant_codes else 0
+                    ho_rows.append({
+                        "交接单ID": h.id, "班次号": h.shift_no,
+                        "交班人": h.handover_from, "接班人": h.handover_to,
+                        "交接时间": h.handover_time,
+                        "遗留任务数": pending_cnt,
+                        "异常植株数": abn_cnt,
+                        "未完成原因": h.unfinished_reason,
+                        "备注": h.remarks,
+                        "是否已确认": "是" if h.confirmed else "否",
+                        "确认时间": h.confirmed_at,
+                    })
+                sheets["交接班汇总"] = pd.DataFrame(ho_rows)
+
+        except Exception as ex:
+            console.print(f"[yellow]⚠ 汇总Sheet生成跳过: {ex}[/yellow]")
+
     if not sheets:
         console.print("[red]✗ 没有可导出的数据[/red]")
         raise typer.Exit(1)
@@ -957,6 +1286,285 @@ def export_cmd(
     except Exception as e:
         console.print(f"[red]✗ 导出失败: {e}[/red]")
         raise typer.Exit(1)
+
+
+# ============================================================
+# shift 命令
+# ============================================================
+@app.command("shift", help="交接班工作流:开/关班次、交班、接班确认、查班次遗留待办")
+def shift_cmd(
+    start: bool = typer.Option(False, "--start", help="开启新班次"),
+    end: bool = typer.Option(False, "--end", help="结束当前班次"),
+    name: str = typer.Option("", "--name", help="班次名称(如白班/夜班/早班)"),
+    leader: str = typer.Option("", "--leader", help="班次负责人/队长"),
+    members: str = typer.Option("", "--members", help="班组成员(逗号分隔)"),
+    handover: bool = typer.Option(False, "--handover", "-h", help="执行交班:生成交接单(需要先结束当前班次)"),
+    handover_to: str = typer.Option("", "--to", help="接班人姓名"),
+    handover_from: str = typer.Option("", "--from", help="交班人(默认取班次负责人)"),
+    reason: str = typer.Option("", "--reason", help="未完成任务原因说明"),
+    remarks: str = typer.Option("", "--remarks", help="交接备注"),
+    confirm: int = typer.Option(0, "--confirm", help="确认接班的交接单ID"),
+    confirmer: str = typer.Option("", "--confirmer", help="确认接班人姓名"),
+    list_shifts: bool = typer.Option(False, "--list", "-l", help="列出班次历史"),
+    list_handovers: bool = typer.Option(False, "--list-handovers", help="列出交接班记录"),
+    detail: int = typer.Option(0, "--detail", help="查看某班次的交接详情(班次ID)"),
+    pending: bool = typer.Option(False, "--pending", help="查看所有班次遗留的待办任务和异常植株"),
+    limit: int = typer.Option(20, "--limit", help="列表显示条数"),
+    db_path: str = typer.Option("", "--db", help="自定义数据库路径"),
+):
+    """交接班工作流管理"""
+    storage = get_storage(db_path)
+    storage.update_overdue_tasks()
+    check_initialized(storage)
+
+    # 1. 开启班次
+    if start:
+        cur = storage.get_current_shift()
+        if cur:
+            console.print(f"[yellow]⚠ 当前已有进行中的班次 {cur.shift_no} ({cur.name})，请先交班或结束[/yellow]")
+            return
+
+        if not name:
+            name = Prompt.ask("班次名称(如:白班/夜班/中班)", default=f"班次{datetime.now().strftime('%m%d')}")
+        if not leader:
+            leader = Prompt.ask("班次负责人/队长姓名", default="")
+        if not members:
+            members = Prompt.ask("班组成员(逗号分隔,可留空)", default="")
+
+        s = Shift(
+            name=name, leader=leader, members=members,
+            start_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            status="进行中",
+        )
+        sid = storage.create_shift(s)
+        s.id = sid
+        console.print(Panel(
+            f"[bold green]✓ 班次已开启[/bold green] (ID: {sid}, 班次号: {s.shift_no})\n\n"
+            f"  班次名称: {name}\n"
+            f"  负责人:   {leader or '-'}\n"
+            f"  班组成员: {members or '-'}\n"
+            f"  开始时间: {s.start_time}",
+            title="开班次成功", border_style="green"
+        ))
+        return
+
+    # 2. 结束班次
+    if end:
+        cur = storage.get_current_shift()
+        if not cur:
+            console.print("[yellow]⚠ 当前没有进行中的班次[/yellow]")
+            return
+        if storage.close_shift(cur.id):
+            console.print(f"[green]✓ 班次 {cur.shift_no} 已结束[/green]")
+        else:
+            console.print(f"[red]✗ 结束班次失败[/red]")
+        return
+
+    # 3. 交班 (--handover)
+    if handover:
+        cur = storage.get_current_shift()
+        if cur:
+            if not Confirm.ask(f"当前班次 {cur.shift_no} ({cur.name}) 仍在进行，是否先结束再交接？", default=True):
+                console.print("[yellow]已取消[/yellow]")
+                return
+            storage.close_shift(cur.id)
+
+        shifts = storage.get_shifts(status="已结束", limit=1)
+        if not shifts:
+            console.print("[red]✗ 没有可交接的已结束班次[/red]")
+            raise typer.Exit(1)
+        shift = shifts[0]
+
+        from_ = handover_from or shift.leader
+        if not from_:
+            from_ = Prompt.ask("交班人姓名", default="交班人")
+        to_ = handover_to
+        if not to_:
+            to_ = Prompt.ask("接班人姓名", default="接班人")
+
+        # 收集本班次进行中/待处理任务 & 非健康植株
+        pending_tasks = storage.get_tasks()
+        pending_tasks = [t for t in pending_tasks if t.status in (TaskStatus.PENDING.value, TaskStatus.IN_PROGRESS.value, TaskStatus.OVERDUE.value)]
+        abnormal_plants = storage.search_plants()
+        abnormal_plants = [p for p in abnormal_plants if p.status != PlantStatus.HEALTHY.value]
+
+        task_ids = ",".join(str(t.id) for t in pending_tasks if t.id)
+        plant_codes = ",".join(p.code for p in abnormal_plants)
+
+        reason_text = reason
+        if not reason_text and pending_tasks:
+            reason_text = Prompt.ask("未完成任务原因说明(可留空)", default="")
+        remarks_text = remarks
+        if not remarks_text:
+            remarks_text = Prompt.ask("其他交接备注(可留空)", default="")
+
+        ho = ShiftHandover(
+            shift_id=shift.id, shift_no=shift.shift_no,
+            handover_from=from_, handover_to=to_,
+            handover_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            pending_task_ids=task_ids,
+            abnormal_plant_codes=plant_codes,
+            unfinished_reason=reason_text,
+            remarks=remarks_text,
+            confirmed=0,
+        )
+        hid = storage.create_handover(ho)
+        ho.id = hid
+
+        # 打印交接清单
+        _print_shift_handover_form(shift, ho, pending_tasks, abnormal_plants)
+        console.print(f"\n[bold green]✓ 交接单已生成 (ID: {hid})[/bold green]，请通知接班人执行 [cyan]python main.py shift --confirm {hid}[/cyan] 确认接班")
+        return
+
+    # 4. 确认接班
+    if confirm > 0:
+        ho = storage.get_handover_by_id(confirm)
+        if not ho:
+            console.print(f"[red]✗ 交接单 #{confirm} 不存在[/red]")
+            raise typer.Exit(1)
+        if ho.confirmed:
+            console.print(f"[yellow]⚠ 交接单 #{confirm} 已于 {ho.confirmed_at} 确认过[/yellow]")
+            return
+        c = confirmer
+        if not c:
+            c = Prompt.ask("请输入接班人姓名确认", default=ho.handover_to or "")
+        if storage.confirm_handover(confirm, c):
+            console.print(f"[green]✓ 交接单 #{confirm} 已确认接班，接班人: {c}[/green]")
+        else:
+            console.print(f"[red]✗ 确认失败[/red]")
+        return
+
+    # 5. 班次详情
+    if detail > 0:
+        shift = storage.get_shift_by_id(detail)
+        if not shift:
+            console.print(f"[red]✗ 班次 #{detail} 不存在[/red]")
+            raise typer.Exit(1)
+        print_shifts_table([shift], title="班次详情")
+
+        handovers = storage.get_handovers(shift_id=detail)
+        if handovers:
+            ho = handovers[0]
+            print_handovers_table(handovers, title="")
+            pending_tasks = storage.get_shift_pending_tasks(detail)
+            abnormal_plants = storage.get_shift_abnormal_plants(detail)
+
+            if pending_tasks:
+                print_tasks_table(pending_tasks, title=f"该班次遗留待办任务 ({len(pending_tasks)}条)")
+            if abnormal_plants:
+                print_plants_table(abnormal_plants, title=f"该班次遗留异常植株 ({len(abnormal_plants)}株)")
+            if ho.unfinished_reason:
+                console.print(Panel(f"未完成原因: {ho.unfinished_reason}", title="未完成说明", border_style="yellow"))
+            if ho.remarks:
+                console.print(Panel(f"备注: {ho.remarks}", title="交接备注", border_style="blue"))
+        else:
+            console.print("[yellow]该班次暂无交接记录[/yellow]")
+        return
+
+    # 6. 查所有班次遗留待办
+    if pending:
+        all_handovers = storage.get_handovers(limit=limit)
+        if not all_handovers:
+            console.print("[yellow]暂无交接记录[/yellow]")
+            return
+        console.print(Panel(f"共 {len(all_handovers)} 条历史交接，以下展示遗留未完成的任务与异常植株:",
+                              title="各交接班次遗留事项", border_style="cyan"))
+        for ho in all_handovers:
+            pending_tasks = storage.get_shift_pending_tasks(ho.shift_id)
+            # 过滤掉已完成的
+            pending_tasks = [t for t in pending_tasks if t.status != TaskStatus.COMPLETED.value]
+            abnormal = storage.get_shift_abnormal_plants(ho.shift_id)
+            abnormal = [p for p in abnormal if p.status != PlantStatus.HEALTHY.value]
+            if not pending_tasks and not abnormal:
+                continue
+            shift = storage.get_shift_by_id(ho.shift_id)
+            badge = "[bold green]✓已确认[/bold green]" if ho.confirmed else f"[bold yellow]⏳待确认[/bold yellow]"
+            console.print(f"\n  [{('green' if ho.confirmed else 'yellow')}]====[/] [cyan]{shift.shift_no if shift else ho.shift_no}[/cyan] "
+                          f"{shift.name if shift else ''} ({ho.handover_from}→{ho.handover_to}) [{badge}] {ho.handover_time}")
+            if pending_tasks:
+                print_tasks_table(pending_tasks, title=f"  遗留待办 ({len(pending_tasks)}条)")
+            if abnormal:
+                print_plants_table(abnormal, title=f"  异常植株 ({len(abnormal)}株)")
+        return
+
+    # 7. 列出交接记录
+    if list_handovers:
+        hos = storage.get_handovers(limit=limit)
+        print_handovers_table(hos, title=f"交接班记录 (最近{len(hos)}条)")
+        return
+
+    # 8. 默认: 列出班次 + 当前状态
+    if list_shifts:
+        shifts = storage.get_shifts(limit=limit)
+        print_shifts_table(shifts, title=f"班次历史 (最近{len(shifts)}条)")
+        return
+
+    # 默认行为: 显示当前班次概况
+    cur = storage.get_current_shift()
+    if cur:
+        print_shifts_table([cur], title="当前进行中的班次")
+    else:
+        console.print(Panel(
+            f"[yellow]当前无进行中的班次[/yellow]\n"
+            f"使用 [cyan]shift --start[/cyan] 开启新班次\n"
+            f"使用 [cyan]shift --list[/cyan] 查看班次历史",
+            title="班次概况", border_style="yellow"
+        ))
+    unconfirmed = storage.get_handovers(unconfirmed_only=True, limit=limit)
+    if unconfirmed:
+        print_handovers_table(unconfirmed, title=f"⚠ 待确认交接单 ({len(unconfirmed)}条)")
+
+
+def _print_shift_handover_form(shift: Shift, ho: ShiftHandover, tasks: List[Task], plants: List[Plant]):
+    sep = "=" * 70
+    console.print(f"\n{sep}")
+    console.print(" " * 25 + "[bold]园区绿植养护 交接班单[/bold]")
+    console.print(sep)
+    console.print(f"班次号: {ho.shift_no}  |  班次: {shift.name}")
+    console.print(f"交接时间: {ho.handover_time}")
+    console.print(f"交班人: {ho.handover_from}  →  接班人: {ho.handover_to}")
+    console.print(f"负责人: {shift.leader}  |  班组成员: {shift.members or '-'}")
+    console.print(f"班次时段: {shift.start_time} ~ {shift.end_time or '-'}")
+    console.print("-" * 70)
+
+    console.print(f"\n[bold]【一、待办养护任务】共 {len(tasks)} 项[/bold]")
+    if tasks:
+        from rich.table import Table as T
+        from rich import box
+        t = T(box=box.SIMPLE)
+        t.add_column("ID", style="cyan")
+        t.add_column("类型")
+        t.add_column("编号")
+        t.add_column("名称")
+        t.add_column("区域")
+        t.add_column("责任人")
+        t.add_column("优先级")
+        t.add_column("截止")
+        t.add_column("状态", style="bold")
+        for tk in tasks:
+            t.add_row(str(tk.id), tk.task_type, tk.plant_code, tk.plant_name,
+                      tk.area or "-", tk.assignee or "-", tk.priority,
+                      tk.due_date or "-", tk.status)
+        console.print(t)
+    else:
+        console.print("  (无)")
+
+    console.print(f"\n[bold]【二、异常植株】共 {len(plants)} 株[/bold]")
+    if plants:
+        print_plants_table(plants, title="")
+    else:
+        console.print("  (无)")
+
+    console.print(f"\n[bold]【三、未完成原因】[/bold]")
+    console.print(f"  {ho.unfinished_reason or '无'}")
+
+    console.print(f"\n[bold]【四、交接备注】[/bold]")
+    console.print(f"  {ho.remarks or '无'}")
+
+    console.print(f"\n[bold]【五、交接签名】[/bold]")
+    console.print(f"\n  交班人签字: _______________    接班人签字: _______________")
+    console.print(f"  交接确认:   [ {'✓已确认' if ho.confirmed else '  待确认  '} ]")
+    console.print(sep + "\n")
 
 
 # ============================================================

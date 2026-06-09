@@ -5,16 +5,26 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 from contextlib import contextmanager
 
-from .models import Plant, Inspection, Photo, Task, PlantStatus, TaskStatus, TaskType
+from .models import Plant, Inspection, Photo, Task, PlantStatus, TaskStatus, TaskType, Shift, ShiftHandover
 
 
 DEFAULT_DB_PATH = os.path.join(os.getcwd(), ".greeninspect", "data.db")
 
 
+def _resolve_db_path(db_path: str) -> str:
+    if not db_path:
+        return DEFAULT_DB_PATH
+    if not os.path.isabs(db_path):
+        db_path = os.path.abspath(db_path)
+    parent = os.path.dirname(db_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return db_path
+
+
 class Storage:
     def __init__(self, db_path: str = DEFAULT_DB_PATH):
-        self.db_path = db_path
-        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self.db_path = _resolve_db_path(db_path)
         self._init_db()
 
     @contextmanager
@@ -92,12 +102,43 @@ class Storage:
                     created_at TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS shifts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    shift_no TEXT UNIQUE NOT NULL,
+                    name TEXT,
+                    leader TEXT,
+                    members TEXT,
+                    start_time TEXT,
+                    end_time TEXT,
+                    status TEXT DEFAULT '进行中',
+                    created_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS shift_handovers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    shift_id INTEGER NOT NULL,
+                    shift_no TEXT,
+                    handover_from TEXT,
+                    handover_to TEXT,
+                    handover_time TEXT,
+                    pending_task_ids TEXT,
+                    abnormal_plant_codes TEXT,
+                    unfinished_reason TEXT,
+                    remarks TEXT,
+                    confirmed INTEGER DEFAULT 0,
+                    confirmed_at TEXT,
+                    created_at TEXT,
+                    FOREIGN KEY (shift_id) REFERENCES shifts(id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_plants_area ON plants(area);
                 CREATE INDEX IF NOT EXISTS idx_inspections_plant ON inspections(plant_code);
                 CREATE INDEX IF NOT EXISTS idx_inspections_date ON inspections(check_date);
                 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
                 CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee);
                 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_date);
+                CREATE INDEX IF NOT EXISTS idx_shifts_status ON shifts(status);
+                CREATE INDEX IF NOT EXISTS idx_handovers_shift ON shift_handovers(shift_id);
             """)
 
     def is_initialized(self) -> bool:
@@ -175,12 +216,21 @@ class Storage:
 
     def get_overdue_plants(self, area: str = "") -> List[Plant]:
         today = datetime.now().strftime("%Y-%m-%d")
-        sql = "SELECT * FROM plants WHERE last_check_date IS NOT NULL AND next_check_date < ?"
-        params = [today]
+        _cycle = "COALESCE(NULLIF(check_cycle_days, 0), 7)"
+        sql = f"""
+            SELECT * FROM plants WHERE (
+                (next_check_date IS NOT NULL AND date(next_check_date) < date(?))
+                OR (next_check_date IS NULL AND last_check_date IS NOT NULL 
+                    AND date(last_check_date, '+' || {_cycle} || ' days') < date(?))
+                OR (last_check_date IS NULL AND planted_date IS NOT NULL
+                    AND date(planted_date, '+' || {_cycle} || ' days') < date(?))
+            )
+        """
+        params = [today, today, today]
         if area:
             sql += " AND area = ?"
             params.append(area)
-        sql += " ORDER BY next_check_date, area, code"
+        sql += f" ORDER BY COALESCE(next_check_date, date(COALESCE(last_check_date, planted_date), '+' || {_cycle} || ' days')), area, code"
         with self._get_conn() as conn:
             c = conn.cursor()
             c.execute(sql, params)
@@ -413,5 +463,259 @@ class Storage:
             plant_name=row["plant_name"], area=row["area"], task_type=row["task_type"],
             description=row["description"], assignee=row["assignee"], priority=row["priority"],
             due_date=row["due_date"], status=row["status"], completed_at=row["completed_at"],
+            created_at=row["created_at"]
+        )
+
+    # ==================== Shifts ====================
+    def create_shift(self, shift: Shift) -> int:
+        import random
+        if not shift.shift_no:
+            shift.shift_no = f"S{datetime.now().strftime('%Y%m%d%H%M%S')}{random.randint(10, 99)}"
+        with self._get_conn() as conn:
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO shifts (shift_no, name, leader, members, start_time, end_time, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                shift.shift_no, shift.name, shift.leader, shift.members,
+                shift.start_time, shift.end_time, shift.status, shift.created_at
+            ))
+            return c.lastrowid
+
+    def get_current_shift(self) -> Optional[Shift]:
+        with self._get_conn() as conn:
+            c = conn.cursor()
+            c.execute("SELECT * FROM shifts WHERE status = '进行中' ORDER BY start_time DESC LIMIT 1")
+            row = c.fetchone()
+            return self._row_to_shift(row) if row else None
+
+    def get_shift_by_id(self, shift_id: int) -> Optional[Shift]:
+        with self._get_conn() as conn:
+            c = conn.cursor()
+            c.execute("SELECT * FROM shifts WHERE id = ?", (shift_id,))
+            row = c.fetchone()
+            return self._row_to_shift(row) if row else None
+
+    def get_shifts(self, status: str = "", limit: int = 50) -> List[Shift]:
+        sql = "SELECT * FROM shifts WHERE 1=1"
+        params = []
+        if status:
+            sql += " AND status = ?"
+            params.append(status)
+        sql += " ORDER BY start_time DESC LIMIT ?"
+        params.append(limit)
+        with self._get_conn() as conn:
+            c = conn.cursor()
+            c.execute(sql, params)
+            return [self._row_to_shift(r) for r in c.fetchall()]
+
+    def close_shift(self, shift_id: int) -> bool:
+        end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._get_conn() as conn:
+            c = conn.cursor()
+            c.execute("UPDATE shifts SET status = '已结束', end_time = ? WHERE id = ?",
+                      (end_time, shift_id))
+            return c.rowcount > 0
+
+    # ==================== ShiftHandovers ====================
+    def create_handover(self, handover: ShiftHandover) -> int:
+        with self._get_conn() as conn:
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO shift_handovers (shift_id, shift_no, handover_from, handover_to,
+                    handover_time, pending_task_ids, abnormal_plant_codes,
+                    unfinished_reason, remarks, confirmed, confirmed_at, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                handover.shift_id, handover.shift_no, handover.handover_from,
+                handover.handover_to, handover.handover_time, handover.pending_task_ids,
+                handover.abnormal_plant_codes, handover.unfinished_reason,
+                handover.remarks, handover.confirmed, handover.confirmed_at,
+                handover.created_at
+            ))
+            return c.lastrowid
+
+    def confirm_handover(self, handover_id: int, confirmer: str = "") -> bool:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._get_conn() as conn:
+            c = conn.cursor()
+            if confirmer:
+                c.execute("UPDATE shift_handovers SET confirmed = 1, confirmed_at = ?, handover_to = COALESCE(NULLIF(handover_to, ''), ?) WHERE id = ?",
+                          (now, confirmer, handover_id))
+            else:
+                c.execute("UPDATE shift_handovers SET confirmed = 1, confirmed_at = ? WHERE id = ?",
+                          (now, handover_id))
+            return c.rowcount > 0
+
+    def get_handovers(self, shift_id: int = 0, unconfirmed_only: bool = False,
+                      limit: int = 50) -> List[ShiftHandover]:
+        sql = """SELECT h.*, s.shift_no AS shift_no
+                 FROM shift_handovers h
+                 LEFT JOIN shifts s ON h.shift_id = s.id
+                 WHERE 1=1"""
+        params = []
+        if shift_id > 0:
+            sql += " AND h.shift_id = ?"
+            params.append(shift_id)
+        if unconfirmed_only:
+            sql += " AND h.confirmed = 0"
+        sql += " ORDER BY h.handover_time DESC LIMIT ?"
+        params.append(limit)
+        with self._get_conn() as conn:
+            c = conn.cursor()
+            c.execute(sql, params)
+            return [self._row_to_handover(r) for r in c.fetchall()]
+
+    def get_handover_by_id(self, handover_id: int) -> Optional[ShiftHandover]:
+        with self._get_conn() as conn:
+            c = conn.cursor()
+            c.execute("""SELECT h.*, s.shift_no AS shift_no
+                         FROM shift_handovers h
+                         LEFT JOIN shifts s ON h.shift_id = s.id
+                         WHERE h.id = ?""", (handover_id,))
+            row = c.fetchone()
+            return self._row_to_handover(row) if row else None
+
+    def get_shift_pending_tasks(self, shift_id: int) -> List[Task]:
+        ho = self.get_handovers(shift_id=shift_id)
+        if not ho:
+            return []
+        ids_str = ho[0].pending_task_ids
+        if not ids_str:
+            return []
+        ids = [int(x.strip()) for x in ids_str.split(",") if x.strip().isdigit()]
+        if not ids:
+            return []
+        sql = f"SELECT * FROM tasks WHERE id IN ({','.join('?' * len(ids))}) ORDER BY due_date"
+        with self._get_conn() as conn:
+            c = conn.cursor()
+            c.execute(sql, ids)
+            return [self._row_to_task(r) for r in c.fetchall()]
+
+    def get_shift_abnormal_plants(self, shift_id: int) -> List[Plant]:
+        ho = self.get_handovers(shift_id=shift_id)
+        if not ho:
+            return []
+        codes_str = ho[0].abnormal_plant_codes
+        if not codes_str:
+            return []
+        codes = [x.strip() for x in codes_str.split(",") if x.strip()]
+        if not codes:
+            return []
+        sql = f"SELECT * FROM plants WHERE code IN ({','.join('?' * len(codes))}) ORDER BY area, code"
+        with self._get_conn() as conn:
+            c = conn.cursor()
+            c.execute(sql, codes)
+            return [self._row_to_plant(r) for r in c.fetchall()]
+
+    # ==================== Analysis Helpers ====================
+    def get_consecutive_abnormal_plants(self, days: int = 7, min_occurrences: int = 3) -> List[Dict]:
+        """找出连续多日多次出现异常的植株"""
+        from collections import defaultdict
+        since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        with self._get_conn() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT plant_code, plant_name, area, check_date, health_score,
+                    has_water_deficit, has_withered, has_pest, needs_pruning, needs_replant, notes
+                FROM inspections
+                WHERE date(check_date) >= date(?)
+                  AND (health_score < 80 OR has_water_deficit = 1 OR has_withered = 1
+                       OR has_pest = 1 OR needs_pruning = 1 OR needs_replant = 1)
+                ORDER BY plant_code, check_date
+            """, (since,))
+            rows = c.fetchall()
+
+        by_plant = defaultdict(list)
+        for r in rows:
+            by_plant[r["plant_code"]].append(dict(r))
+
+        result = []
+        for code, records in by_plant.items():
+            if len(records) >= min_occurrences:
+                # 统计问题类型
+                issues = defaultdict(int)
+                scores = []
+                for rec in records:
+                    scores.append(rec["health_score"])
+                    if rec["has_water_deficit"]:
+                        issues["缺水"] += 1
+                    if rec["has_withered"]:
+                        issues["枯黄"] += 1
+                    if rec["has_pest"]:
+                        issues["虫害"] += 1
+                    if rec["needs_pruning"]:
+                        issues["需修剪"] += 1
+                    if rec["needs_replant"]:
+                        issues["需补苗"] += 1
+                top_issues = sorted(issues.items(), key=lambda x: -x[1])
+                avg_score = round(sum(scores) / len(scores), 1)
+                result.append({
+                    "plant_code": code,
+                    "plant_name": records[0]["plant_name"],
+                    "area": records[0]["area"],
+                    "abnormal_days": len(records),
+                    "avg_score": avg_score,
+                    "first_date": records[0]["check_date"][:10],
+                    "last_date": records[-1]["check_date"][:10],
+                    "top_issue": top_issues[0][0] if top_issues else "低评分",
+                    "issue_detail": "、".join(f"{k}x{v}" for k, v in top_issues),
+                })
+        result.sort(key=lambda x: (-x["abnormal_days"], x["avg_score"]))
+        return result
+
+    def get_repeat_issue_summary(self, days: int = 14) -> List[Dict]:
+        """统计重复出现的问题类型，按区域+责任人分组"""
+        since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        tasks = self.get_tasks()
+        from collections import defaultdict
+        group = defaultdict(lambda: defaultdict(int))
+        for t in tasks:
+            if t.created_at and t.created_at[:10] < since:
+                continue
+            key = (t.area or "未分区域", t.assignee or "未指派", t.task_type)
+            group[key]["总次数"] += 1
+            if t.status == TaskStatus.COMPLETED.value:
+                group[key]["已完成"] += 1
+            else:
+                group[key]["未完成"] += 1
+                if t.status == TaskStatus.OVERDUE.value:
+                    group[key]["已逾期"] += 1
+
+        result = []
+        for (area, assignee, ttype), cnt in group.items():
+            result.append({
+                "area": area,
+                "assignee": assignee,
+                "task_type": ttype,
+                "total": cnt["总次数"],
+                "done": cnt.get("已完成", 0),
+                "pending": cnt.get("未完成", 0),
+                "overdue": cnt.get("已逾期", 0),
+                "done_rate": round(cnt.get("已完成", 0) / cnt["总次数"] * 100, 1),
+            })
+        result.sort(key=lambda x: (-x["total"], x["area"]))
+        return result
+
+    # ==================== Shift Row Mappers ====================
+    def _row_to_shift(self, row) -> Shift:
+        return Shift(
+            id=row["id"], shift_no=row["shift_no"], name=row["name"],
+            leader=row["leader"], members=row["members"],
+            start_time=row["start_time"], end_time=row["end_time"],
+            status=row["status"], created_at=row["created_at"]
+        )
+
+    def _row_to_handover(self, row) -> ShiftHandover:
+        return ShiftHandover(
+            id=row["id"], shift_id=row["shift_id"], shift_no=row["shift_no"],
+            handover_from=row["handover_from"], handover_to=row["handover_to"],
+            handover_time=row["handover_time"],
+            pending_task_ids=row["pending_task_ids"],
+            abnormal_plant_codes=row["abnormal_plant_codes"],
+            unfinished_reason=row["unfinished_reason"],
+            remarks=row["remarks"],
+            confirmed=bool(row["confirmed"]),
+            confirmed_at=row["confirmed_at"],
             created_at=row["created_at"]
         )
