@@ -114,6 +114,7 @@ class ShiftHandover:
     handover_time: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     pending_task_ids: str = ""
     abnormal_plant_codes: str = ""
+    overdue_plant_codes: str = ""
     unfinished_reason: str = ""
     remarks: str = ""
     confirmed: int = 0
