@@ -942,6 +942,163 @@ class Storage:
             result["assignee_ranking"].append(p)
         return result
 
+    # ==================== 负责人绩效考核 (issue2_new) ====================
+    def get_assignee_performance(self, start_date: str, end_date: str, area: str = "") -> Dict:
+        """
+        个人工作量 & 质量趋势统计（按自然周/月/自定义区间）
+        返回: {'period_label', 'start_date', 'end_date', 'people': [...]}
+        people每项字段:
+          user, created_tasks(生成本人指派), completed_tasks(区间内完成),
+          pending_handover_taken(接手遗留数), pending_handover_closed(已闭环遗留数),
+          pending_handover_open(遗留未闭环), overdue_remaining(逾期未完成剩余),
+          avg_hours_per_task(平均处理时长小时), insp_count(巡检次数),
+          avg_inspection_score(平均巡检分), composite_score(综合绩效)
+        """
+        from collections import defaultdict
+
+        # 初始化所有相关人员
+        users = set()
+        # 1. 任务中出现过的人
+        with self._get_conn() as conn:
+            c = conn.cursor()
+            for col in ["assignee", "completed_by"]:
+                if col == "completed_by":
+                    continue  # tasks 没有 completed_by 字段, 用 completed_at 关联
+                area_q = f"AND area = '{area}'" if area else ""
+                c.execute(f"SELECT DISTINCT {col} FROM tasks WHERE {col} IS NOT NULL AND {col} != '' {area_q}")
+                users.update(r[col] for r in c.fetchall())
+            # 2. 巡检人
+            area_q2 = f"AND area = '{area}'" if area else ""
+            c.execute(f"SELECT DISTINCT inspector FROM inspections WHERE inspector IS NOT NULL AND inspector != '' {area_q2}")
+            users.update(r["inspector"] for r in c.fetchall())
+            # 3. 遗留事项责任人
+            c.execute("SELECT DISTINCT current_assignee FROM shift_pending_items WHERE current_assignee IS NOT NULL AND current_assignee != ''")
+            users.update(r["current_assignee"] for r in c.fetchall())
+            c.execute("SELECT DISTINCT processed_by FROM shift_pending_items WHERE processed_by IS NOT NULL AND processed_by != ''")
+            users.update(r["processed_by"] for r in c.fetchall())
+
+        base = {"created_tasks": 0, "completed_tasks": 0,
+                "pending_taken": 0, "pending_closed": 0, "pending_open": 0,
+                "overdue_remaining": 0,
+                "task_duration_hours": [],
+                "insp_count": 0, "insp_scores": []}
+        perf = {u: {**base, "user": u} for u in users if u}
+
+        # A. 任务维度 (区间内 创建/完成)
+        area_q = f"AND area = '{area}'" if area else ""
+        with self._get_conn() as conn:
+            c = conn.cursor()
+            # A1: 区间内创建、且指配人的任务
+            c.execute(f"""SELECT id, task_no, assignee, status, created_at, due_date, completed_at
+                FROM tasks WHERE created_at >= ? AND created_at <= ? {area_q}""",
+                      (start_date + " 00:00:00", end_date + " 23:59:59"))
+            for r in c.fetchall():
+                u = r["assignee"] or "未指派"
+                if u in perf:
+                    perf[u]["created_tasks"] += 1
+                # 逾期未完成：状态未完成 且 已过截止
+                if r["status"] not in ("已完成", "已闭环", "已处理") and r["due_date"] and r["due_date"] < end_date:
+                    if u in perf:
+                        perf[u]["overdue_remaining"] += 1
+
+            # A2: 区间内完成 (completed_at 落在区间)
+            c.execute(f"""SELECT id, task_no, assignee, status, created_at, due_date, completed_at
+                FROM tasks WHERE completed_at >= ? AND completed_at <= ? {area_q}""",
+                      (start_date + " 00:00:00", end_date + " 23:59:59"))
+            for r in c.fetchall():
+                u = r["assignee"] or "未指派"
+                if u in perf:
+                    perf[u]["completed_tasks"] += 1
+                # 计算处理时长 (小时)
+                try:
+                    if r["created_at"] and r["completed_at"]:
+                        d1 = datetime.strptime(r["created_at"][:19], "%Y-%m-%d %H:%M:%S")
+                        d2 = datetime.strptime(r["completed_at"][:19], "%Y-%m-%d %H:%M:%S")
+                        h = round((d2 - d1).total_seconds() / 3600, 2)
+                        if h < 24 * 30:  # 合理值过滤
+                            if u in perf:
+                                perf[u]["task_duration_hours"].append(h)
+                except Exception:
+                    pass
+
+            # B. 遗留事项维度
+            c.execute("""SELECT id, item_type, original_assignee, current_assignee,
+                status, process_result, processed_by, processed_at, created_at
+                FROM shift_pending_items
+                WHERE created_at >= ? OR processed_at >= ? OR status != '已闭环'""",
+                      (start_date + " 00:00:00", start_date + " 00:00:00"))
+            for r in c.fetchall():
+                # B1: 被指派(接手)次数
+                u = r["current_assignee"] or ""
+                if u in perf:
+                    perf[u]["pending_taken"] += 1
+                # B2: 区间内闭环
+                is_closed = (r["status"] or "") in ("已完成", "已闭环", "已处理", "已取消")
+                if is_closed and r["processed_at"] and start_date <= r["processed_at"][:10] <= end_date:
+                    pu = r["processed_by"] or u
+                    if pu in perf:
+                        perf[pu]["pending_closed"] += 1
+                    # 也记入当前接手人
+                    if u in perf and u != pu:
+                        perf[u]["pending_closed"] += 1
+                # B3: 未闭环
+                if not is_closed:
+                    if u in perf:
+                        perf[u]["pending_open"] += 1
+
+            # C. 巡检维度 (区间内)
+            area_q3 = f"AND area = '{area}'" if area else ""
+            c.execute(f"""SELECT inspector, health_score FROM inspections
+                WHERE substr(check_date,1,10) >= ? AND substr(check_date,1,10) <= ? {area_q3}""",
+                      (start_date, end_date))
+            for r in c.fetchall():
+                u = r["inspector"] or "未记录"
+                if u in perf:
+                    perf[u]["insp_count"] += 1
+                    perf[u]["insp_scores"].append(r["health_score"] or 0)
+
+        # D. 计算汇总字段
+        final = []
+        for u, p in perf.items():
+            durations = p["task_duration_hours"]
+            avg_h = round(sum(durations) / len(durations), 1) if durations else 0
+            scores = p["insp_scores"]
+            avg_s = round(sum(scores) / len(scores), 1) if scores else 0
+            # 综合绩效: 完成数×40% + 闭环率×25% + 巡检均分×20% - 逾期×15%
+            task_done_total = p["completed_tasks"] + p["pending_closed"]
+            pending_total = p["pending_taken"] or 1
+            closed_rate = round(p["pending_closed"] / pending_total * 100, 1) if p["pending_taken"] else 100
+            composite = round(
+                (min(task_done_total * 2, 100) * 0.4) +
+                (closed_rate * 0.25) +
+                ((avg_s if avg_s else 60) * 0.2) +
+                (max(0, 100 - p["overdue_remaining"] * 10) * 0.15)
+                , 1
+            )
+            final.append({
+                "user": u,
+                "created_tasks": p["created_tasks"],
+                "completed_tasks": p["completed_tasks"],
+                "pending_taken": p["pending_taken"],
+                "pending_closed": p["pending_closed"],
+                "pending_open": p["pending_open"],
+                "pending_closed_rate": closed_rate,
+                "overdue_remaining": p["overdue_remaining"],
+                "avg_task_hours": avg_h,
+                "insp_count": p["insp_count"],
+                "avg_inspection_score": avg_s,
+                "composite_score": composite,
+            })
+        final.sort(key=lambda x: -x["composite_score"])
+        for idx, x in enumerate(final, 1):
+            x["rank"] = idx
+        return {
+            "start_date": start_date, "end_date": end_date,
+            "period_label": f"{start_date} ~ {end_date}",
+            "people_count": len(final),
+            "people": final
+        }
+
     # ==================== 提醒看板 (issue4) ====================
     def get_upcoming_reminders(self, scope: str = "3days") -> Dict:
         """
@@ -1031,21 +1188,72 @@ class Storage:
             except Exception:
                 pass
 
+        # ---- 早会优先级打标：P0逾期 > P1今到期/异常未派 > P2连续异常 > P3正常 ----
+        abn_set, abn_notask_set = set(), set()
+        try:
+            abn_list = self.get_consecutive_abnormal_plants(days=14, min_occurrences=2)
+            abn_set = {a["plant_code"] for a in abn_list}
+            abn_notask_set = {a["plant_code"] for a in abn_list if not a.get("has_task")}
+        except Exception:
+            pass
+
+        def _score_check(c):
+            days = c.get("days_left") or 999
+            code = c["plant"].code
+            if c.get("is_overdue") or days < 0:
+                return 0, "P0", "🔴", "逾期未检(最高优先级)"
+            if code in abn_notask_set and days <= 3:
+                return 1, "P1", "🟠", "连续异常未派任务"
+            if days == 0:
+                return 1, "P1", "🟠", "今天到检"
+            if code in abn_set:
+                return 2, "P2", "🟡", "连续异常植株"
+            return 3, "P3", "🟢", "正常到检"
+
+        def _score_task(t):
+            days = t.get("days_left") or 999
+            if days < 0:
+                return 0, "P0", "🔴", "已逾期"
+            if days == 0:
+                return 1, "P1", "🟠", "今天到期"
+            return 3, "P3", "🟢", "正常到期"
+
+        for c in due_checks:
+            s, lvl, emo, reason = _score_check(c)
+            c["priority_score"] = s
+            c["priority_level"] = lvl
+            c["priority_emoji"] = emo
+            c["priority_reason"] = reason
+        for t in due_tasks:
+            s, lvl, emo, reason = _score_task(t)
+            t["priority_score"] = s
+            t["priority_level"] = lvl
+            t["priority_emoji"] = emo
+            t["priority_reason"] = reason
+
         # 按区域分组（优先级：先按区域，再按责任人）
         by_area = defaultdict(lambda: {"checks": [], "tasks": []})
-        for c in due_checks:
+        for c in sorted(due_checks, key=lambda x: (x["priority_score"], x.get("days_left") or 999)):
             by_area[c["plant"].area or "未分区域"]["checks"].append(c)
-        for t in due_tasks:
+        for t in sorted(due_tasks, key=lambda x: (x["priority_score"], x.get("days_left") or 999)):
             by_area[t["task"].area or "未分区域"]["tasks"].append(t)
 
         # 按责任人人分组任务
         by_assignee = defaultdict(list)
-        for t in due_tasks:
+        for t in sorted(due_tasks, key=lambda x: (x["priority_score"], x.get("days_left") or 999)):
             by_assignee[t["task"].assignee or "未指派"].append(t)
 
-        # 排序：已逾期在前，剩余天数升序
-        due_checks.sort(key=lambda x: (0 if x["is_overdue"] else 1, x["days_left"] or 999))
-        due_tasks.sort(key=lambda x: (0 if x["days_left"] < 0 else 1, x["days_left"]))
+        # 最终排序：优先级+剩余天数二级排序(早会重点在上)
+        due_checks.sort(key=lambda x: (x["priority_score"], x.get("days_left") or 999))
+        due_tasks.sort(key=lambda x: (x["priority_score"], x.get("days_left") or 999))
+
+        # 优先级分布统计
+        p_count_c = {"P0": 0, "P1": 0, "P2": 0, "P3": 0}
+        p_count_t = {"P0": 0, "P1": 0, "P2": 0, "P3": 0}
+        for c in due_checks:
+            p_count_c[c["priority_level"]] = p_count_c.get(c["priority_level"], 0) + 1
+        for t in due_tasks:
+            p_count_t[t["priority_level"]] = p_count_t.get(t["priority_level"], 0) + 1
 
         return {
             "scope": scope, "scope_label": label,
@@ -1054,57 +1262,119 @@ class Storage:
             "due_tasks": due_tasks,
             "by_area": by_area,
             "by_assignee": by_assignee,
+            "priority_distribution": {"checks": p_count_c, "tasks": p_count_t},
             "summary": {
                 "checks_count": len(due_checks),
                 "checks_overdue": sum(1 for c in due_checks if c["is_overdue"]),
                 "tasks_count": len(due_tasks),
                 "tasks_overdue": sum(1 for t in due_tasks if t["days_left"] < 0),
+                "urgent_p0_p1": p_count_c["P0"] + p_count_c["P1"] + p_count_t["P0"] + p_count_t["P1"],
             }
         }
 
-    # ==================== 任务批量完成结果导入 (issue5) ====================
+    # ==================== 任务批量完成结果导入 (issue5, issue3_new) ====================
     def import_task_completion(self, records: List[Dict]) -> Dict:
         """
         records: 每条含 task_no, processor(处理人), completed_at(完成时间可选), result(备注/处理结果可选), new_status(可选，默认已完成)
-        返回: {success, failed, skipped, details: [{'task_no','ok','msg'}]}
+        抗造特性: 空任务号跳过、重复任务号取最后一条、不存在的任务号算失败，均不中断
+        返回: {
+          total, success, failed, skipped,
+          success_list: [{task_no, task_id, processor, status, completed_at}],
+          skipped_list: [{row_index, reason, raw}],
+          failed_list:  [{row_index, task_no, reason, raw}],
+          details: [{'task_no','ok','msg'}] (兼容旧格式)
+        }
         """
-        summary = {"success": 0, "failed": 0, "skipped": 0, "details": []}
-        for rec in records:
+        # 第1步：按 task_no 去重，保留最后一条
+        seen = {}
+        skip_list = []
+        for idx, rec in enumerate(records):
+            tno = (rec.get("task_no") or rec.get("任务编号") or rec.get("编号") or "").strip()
+            if not tno:
+                skip_list.append({"row_index": idx + 1, "reason": "任务编号为空", "raw": rec})
+                continue
+            seen[tno] = (idx, rec)
+        dedup = [r for _, r in seen.values()]
+
+        summary = {
+            "total": len(records),
+            "success": 0, "failed": 0, "skipped": len(skip_list),
+            "success_list": [], "skipped_list": skip_list, "failed_list": [],
+            "details": []
+        }
+        # 把之前跳过的空行记入兼容格式
+        for s in skip_list:
+            summary["details"].append({"task_no": "(空)", "ok": False, "msg": s["reason"]})
+
+        # 第2步：逐条处理
+        for row_index_in_dedup, rec in enumerate(dedup, 1):
             tno = (rec.get("task_no") or rec.get("任务编号") or rec.get("编号") or "").strip()
             processor = (rec.get("processor") or rec.get("处理人") or rec.get("完成人") or "").strip()
             completed_at = (rec.get("completed_at") or rec.get("完成时间") or rec.get("处理时间") or "").strip()
             result = (rec.get("result") or rec.get("备注") or rec.get("处理结果") or rec.get("说明") or "").strip()
             new_status = (rec.get("new_status") or rec.get("状态") or TaskStatus.COMPLETED.value).strip()
 
-            if not tno:
-                summary["skipped"] += 1
-                summary["details"].append({"task_no": "(空)", "ok": False, "msg": "缺少任务编号，跳过"})
-                continue
             if not completed_at:
                 completed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            # 找到任务
-            with self._get_conn() as conn:
-                c = conn.cursor()
-                c.execute("SELECT * FROM tasks WHERE task_no = ?", (tno,))
-                row = c.fetchone()
-                if not row:
-                    summary["failed"] += 1
-                    summary["details"].append({"task_no": tno, "ok": False, "msg": "任务编号不存在"})
-                    continue
-                if processor:
-                    c.execute("UPDATE tasks SET status = ?, completed_at = ?, assignee = COALESCE(NULLIF(assignee, ''), ?) WHERE task_no = ?",
-                              (new_status, completed_at, processor, tno))
-                else:
-                    c.execute("UPDATE tasks SET status = ?, completed_at = ? WHERE task_no = ?",
-                              (new_status, completed_at, tno))
-                # 追加备注（合并现有任务说明）
-                if result:
-                    existing = row["description"] or ""
-                    if result[:20] not in existing:
-                        c.execute("UPDATE tasks SET description = ? WHERE task_no = ?",
-                                  (f"{existing} | 完成说明:{result[:200]}" if existing else f"完成说明:{result[:200]}", tno))
+            task_id = None
+            try:
+                with self._get_conn() as conn:
+                    c = conn.cursor()
+                    c.execute("SELECT * FROM tasks WHERE task_no = ?", (tno,))
+                    row = c.fetchone()
+                    if not row:
+                        summary["failed"] += 1
+                        summary["failed_list"].append({
+                            "row_index": row_index_in_dedup,
+                            "task_no": tno, "reason": "任务编号不存在", "raw": rec
+                        })
+                        summary["details"].append({"task_no": tno, "ok": False, "msg": "任务编号不存在"})
+                        continue
+
+                    task_id = row["id"]
+                    # 更新任务
+                    if processor:
+                        c.execute("UPDATE tasks SET status = ?, completed_at = ?, assignee = COALESCE(NULLIF(assignee, ''), ?) WHERE task_no = ?",
+                                  (new_status, completed_at, processor, tno))
+                    else:
+                        c.execute("UPDATE tasks SET status = ?, completed_at = ? WHERE task_no = ?",
+                                  (new_status, completed_at, tno))
+                    # 追加备注（合并现有任务说明）
+                    if result:
+                        existing = row["description"] or ""
+                        snippet = result[:200]
+                        if snippet not in (existing or ""):
+                            new_desc = f"{existing} | 完成说明:{snippet}" if existing else f"完成说明:{snippet}"
+                            c.execute("UPDATE tasks SET description = ? WHERE task_no = ?", (new_desc, tno))
+
+                    # 若该任务在某未闭环的遗留事项中，也同步 pending_item 的状态和处理人
+                    if new_status in ("已完成", "已闭环", "已处理"):
+                        c.execute("""UPDATE shift_pending_items
+                            SET status = '已闭环',
+                                process_result = COALESCE(process_result,'') || ?,
+                                processed_by   = COALESCE(NULLIF(processed_by,''), ?),
+                                processed_at   = COALESCE(processed_at, ?)
+                            WHERE item_type = '任务' AND ref_code = ?
+                              AND status NOT IN ('已完成','已闭环','已处理','已取消')""",
+                                  (f"[导入{datetime.now().strftime('%Y-%m-%d %H:%M')}] {result or '批量导入完成'}; ",
+                                   processor or "批量导入", completed_at, tno))
+            except Exception as e:
+                summary["failed"] += 1
+                summary["failed_list"].append({
+                    "row_index": row_index_in_dedup,
+                    "task_no": tno, "reason": f"异常: {str(e)[:80]}", "raw": rec
+                })
+                summary["details"].append({"task_no": tno, "ok": False, "msg": f"处理异常: {e}"})
+                continue
+
             summary["success"] += 1
+            summary["success_list"].append({
+                "task_no": tno, "task_id": task_id,
+                "processor": processor or "(未变)",
+                "status": new_status, "completed_at": completed_at,
+                "result": result
+            })
             summary["details"].append({"task_no": tno, "ok": True,
                                        "msg": f"状态更新为{new_status}, 处理人{processor or '未变'}"})
         return summary
@@ -1181,7 +1451,7 @@ class Storage:
     def update_pending_item(self, item_id: int, *, new_assignee: str = "",
                             new_status: str = "", process_result: str = "",
                             processed_by: str = "") -> bool:
-        """重新指派责任人、补处理结果、更新闭环状态"""
+        """重新指派责任人、补处理结果、更新闭环状态；同时同步真实tasks表"""
         updates, params = [], []
         if new_assignee:
             updates.append("current_assignee = ?")
@@ -1200,15 +1470,49 @@ class Storage:
             params.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         if not updates:
             return False
+
+        # 先查item详情，后续同步tasks需要
+        item_info = None
+        with self._get_conn() as conn:
+            c = conn.cursor()
+            c.execute("SELECT item_type, ref_id, ref_code FROM shift_pending_items WHERE id = ?", (item_id,))
+            r = c.fetchone()
+            if r:
+                item_info = dict(r)
+
         params.append(item_id)
         sql = f"UPDATE shift_pending_items SET {', '.join(updates)} WHERE id = ?"
+        rowcount = 0
         with self._get_conn() as conn:
             c = conn.cursor()
             c.execute(sql, params)
-            return c.rowcount > 0
+            rowcount = c.rowcount
 
-    def get_shift_closed_loop_status(self, shift_id: int) -> Dict:
-        """某班次下所有遗留事项的闭环统计"""
+            # 同步：若item_type=任务，则同步真实 tasks 表
+            if rowcount > 0 and item_info and item_info.get("item_type") == "任务":
+                tno = item_info.get("ref_code")
+                tid = item_info.get("ref_id")
+                if tno or tid:
+                    q = "SELECT id FROM tasks WHERE task_no = ? OR id = ? LIMIT 1"
+                    c.execute(q, (tno or "", tid or 0))
+                    task_row = c.fetchone()
+                    if task_row:
+                        real_tid = task_row["id"]
+                        if new_assignee:
+                            c.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (new_assignee, real_tid))
+                        if new_status and new_status in ("已完成", "已闭环", "已处理"):
+                            c.execute("""UPDATE tasks
+                                SET status = '已完成',
+                                    completed_at = COALESCE(completed_at, ?)
+                                WHERE id = ?""",
+                                      (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), real_tid))
+        return rowcount > 0
+
+    def get_shift_closed_loop_status(self, shift_id: int, status_filter: str = "") -> Dict:
+        """
+        某班次下所有遗留事项的闭环统计
+        status_filter: ''(全部) | '未闭环' | '已闭环'
+        """
         handovers = self.get_handovers(shift_id=shift_id, limit=50)
         result = {"handovers": len(handovers),
                   "items_total": 0, "items_closed": 0, "items_pending": 0,
@@ -1217,6 +1521,11 @@ class Storage:
             items = self.get_handover_items(ho.id)
             for it in items:
                 it_closed = (it["status"] or "") in ("已完成", "已闭环", "已处理", "已取消")
+                # 过滤
+                if status_filter == "未闭环" and it_closed:
+                    continue
+                if status_filter == "已闭环" and not it_closed:
+                    continue
                 result["items_total"] += 1
                 if it_closed:
                     result["items_closed"] += 1
@@ -1228,3 +1537,245 @@ class Storage:
         if result["items_total"]:
             result["closed_rate"] = round(result["items_closed"] / result["items_total"] * 100, 1)
         return result
+
+    # ==================== 历史追溯查询 (issue5_new) ====================
+    def get_entity_trace(self, *, plant_code: str = "", task_no: str = "",
+                         task_id: Optional[int] = None) -> Dict:
+        """
+        按 植株编号 或 任务号/任务ID 聚合查询完整的处理时间线，方便现场解释：
+        返回: {
+            'entity_type': 'plant'|'task'|'unknown',
+            'plant_info': {...}, 'task_info': {...},
+            'events': [ {time, type, level, content, raw} ] 时间倒序
+        }
+        events.type: [巡检记录]|[派单生成]|[任务更新]|[交接班]|[重指派]|[闭环记录]
+        """
+        entity_type = "unknown"
+        plant_info, task_info = None, None
+        events = []
+
+        # ---------- 步骤1：先查实体基本信息 ----------
+        plant_code = (plant_code or "").strip()
+        task_no = (task_no or "").strip()
+
+        with self._get_conn() as conn:
+            c = conn.cursor()
+
+            # A. 查植株档案
+            if plant_code:
+                c.execute("SELECT * FROM plants WHERE code = ?", (plant_code,))
+                r = c.fetchone()
+                if r:
+                    plant_info = dict(r)
+                    entity_type = "plant"
+                    events.append({
+                        "time": r["planted_date"] or r["created_at"] or "",
+                        "type": "档案录入", "level": "INFO",
+                        "content": f"📋 植株建档: {r['code']} / {r['name']} / {r['species'] or '-'} / {r['area'] or '-'}",
+                        "raw": "plants表"
+                    })
+                    events.append({
+                        "time": (r["last_check_date"] or "") + " " + (r["status"] or ""),
+                        "type": "当前状态", "level": "STATUS",
+                        "content": f"🏷  当前状态: {r['status']}    上次巡检: {r['last_check_date'] or '未巡检'}    下次巡检: {r['next_check_date'] or '未设置'}",
+                        "raw": "plants当前"
+                    })
+
+            # B. 查任务档案
+            if task_no or task_id:
+                if task_id:
+                    c.execute("SELECT * FROM tasks WHERE id = ?", (task_id,))
+                else:
+                    c.execute("SELECT * FROM tasks WHERE task_no = ?", (task_no,))
+                r = c.fetchone()
+                if r:
+                    task_info = dict(r)
+                    entity_type = "task"
+                    # 如果该任务关联某植株，同时获取plant_info
+                    if r["plant_code"] and not plant_info:
+                        c2 = conn.cursor()
+                        c2.execute("SELECT * FROM plants WHERE code = ?", (r["plant_code"],))
+                        pr = c2.fetchone()
+                        if pr:
+                            plant_info = dict(pr)
+                    events.append({
+                        "time": r["created_at"] or "",
+                        "type": "任务创建", "level": "INFO",
+                        "content": (
+                            f"📝 创建任务#{r['task_no']} [{r['task_type']}] 指派人: {r['assignee'] or '未指派'} 截止: {r['due_date'] or '-'} 优先级:{r['priority']}\n"
+                            f"        → 植株: {r['plant_code']} {r['plant_name'] or ''} / {r['area'] or '-'}\n"
+                            f"        → 描述: {(r['description'] or '')[:200]}"
+                        ),
+                        "raw": "tasks create"
+                    })
+                    # 完成情况
+                    if r["status"] in ("已完成", "已闭环"):
+                        events.append({
+                            "time": r["completed_at"] or "",
+                            "type": "任务完成", "level": "SUCCESS",
+                            "content": f"✅ 任务已完成 at {r['completed_at']}",
+                            "raw": "tasks done"
+                        })
+                    elif r["status"] == TaskStatus.OVERDUE.value:
+                        events.append({
+                            "time": r["due_date"] or "",
+                            "type": "任务逾期", "level": "ERROR",
+                            "content": f"🔴 任务已逾期(截止: {r['due_date']})，当前状态: {r['status']}",
+                            "raw": "tasks overdue"
+                        })
+                    else:
+                        events.append({
+                            "time": r["due_date"] or "",
+                            "type": "任务进行中", "level": "WARN",
+                            "content": f"🟡 当前状态: {r['status']}，截止: {r['due_date']}",
+                            "raw": "tasks pending"
+                        })
+
+            # ---------- 步骤2：根据实体补充关联历史 ----------
+            search_code = plant_code or (task_info and task_info.get("plant_code") or "")
+            search_task_no = task_no or (task_info and task_info.get("task_no") or "")
+            search_task_id = task_id or (task_info and task_info.get("id") or None)
+
+            # A. 该植株所有巡检记录
+            if search_code:
+                c.execute("""SELECT * FROM inspections
+                    WHERE plant_code = ? ORDER BY check_date DESC, created_at DESC""",
+                          (search_code,))
+                for r in c.fetchall():
+                    issues = []
+                    if r["has_pest"]: issues.append("虫害")
+                    if r["has_water_deficit"]: issues.append("缺水")
+                    if r["has_withered"]: issues.append("枯黄")
+                    if r["needs_pruning"]: issues.append("需修剪")
+                    if r["needs_replant"]: issues.append("需补苗")
+                    lvl = "WARN" if issues or (r["health_score"] or 100) < 80 else "INFO"
+                    events.append({
+                        "time": r["check_date"] or r["created_at"] or "",
+                        "type": "巡检记录",
+                        "level": lvl,
+                        "content": (
+                            f"🔍 巡检评分: {r['health_score']}分  巡检人: {r['inspector'] or '-'}  区域: {r['area'] or '-'}\n"
+                            f"        → 发现: {','.join(issues) if issues else '无异常'}   备注: {(r['notes'] or '')[:150]}"
+                        ),
+                        "raw": f"insp#{r['id']}"
+                    })
+
+            # B. 该植株/任务关联的任务记录
+            where, args = [], []
+            if search_code:
+                where.append("plant_code = ?")
+                args.append(search_code)
+            if search_task_no:
+                where.append("task_no = ?")
+                args.append(search_task_no)
+            if search_task_id:
+                where.append("id = ?")
+                args.append(search_task_id)
+            if where:
+                c.execute(f"SELECT * FROM tasks WHERE {' OR '.join(where)} ORDER BY created_at DESC", args)
+                for r in c.fetchall():
+                    if task_info and r["id"] == task_info["id"]:
+                        continue  # 避免重复
+                    events.append({
+                        "time": r["created_at"] or "",
+                        "type": f"任务-{r['status']}",
+                        "level": "WARN" if r["status"] not in ("已完成",) else "SUCCESS",
+                        "content": (
+                            f"📋 任务#{r['task_no']} [{r['task_type']}] {r['status']}  指派人: {r['assignee'] or '未指派'}  截止: {r['due_date'] or '-'}\n"
+                            f"        → {(r['description'] or '')[:200]}"
+                        ),
+                        "raw": f"task#{r['id']}"
+                    })
+
+            # C. 交接班遗留事项记录(含重指派、闭环)
+            c_args = []
+            where2 = []
+            if search_task_no or search_task_id:
+                where2.append("(item_type='任务' AND (ref_code = ? OR ref_id = ?))")
+                c_args += [search_task_no or "", search_task_id or 0]
+            if search_code:
+                where2.append("(item_type IN ('异常株','逾期未检') AND ref_code = ?)")
+                c_args.append(search_code)
+            if where2:
+                c.execute(f"""SELECT i.*, h.shift_no, h.handover_from, h.handover_to
+                    FROM shift_pending_items i
+                    LEFT JOIN shift_handovers h ON h.id = i.handover_id
+                    WHERE {' OR '.join(where2)}
+                    ORDER BY i.created_at DESC, i.id DESC""", c_args)
+                for r in c.fetchall():
+                    events.append({
+                        "time": r["created_at"] or "",
+                        "type": "交接班-遗留事项",
+                        "level": "WARN",
+                        "content": (
+                            f"🤝 {r['shift_no'] or ''} 交接单#{r['handover_id']}: {r['handover_from'] or ''}→{r['handover_to'] or ''}\n"
+                            f"        → 类型:{r['item_type']} 标题:{r['title']}\n"
+                            f"        → 原责任人:{r['original_assignee'] or '-'} → 当前:{r['current_assignee'] or '-'}   状态:{r['status']}\n"
+                            + (f"        → 处理结果:{(r['process_result'] or '')[:200]}" if r['process_result'] else "")
+                            + (f"  (处理人:{r['processed_by'] or '-'} @{r['processed_at'] or '-'})" if r['processed_at'] else "")
+                        ),
+                        "raw": f"pending_item#{r['id']}"
+                    })
+                    # 若当前接手人 != 原，加一条"重指派"事件
+                    if r["current_assignee"] and r["original_assignee"] and r["current_assignee"] != r["original_assignee"]:
+                        events.append({
+                            "time": r["processed_at"] or r["created_at"] or "",
+                            "type": "任务重指派",
+                            "level": "WARN",
+                            "content": f"🔁 事项#{r['id']} 重新指派: {r['original_assignee']} → {r['current_assignee']}",
+                            "raw": f"reassign#{r['id']}"
+                        })
+                    if r["status"] in ("已闭环", "已完成", "已处理"):
+                        events.append({
+                            "time": r["processed_at"] or "",
+                            "type": "闭环记录",
+                            "level": "SUCCESS",
+                            "content": f"✅ 事项#{r['id']} 已闭环 by {r['processed_by'] or '-'} @ {r['processed_at'] or '-'}",
+                            "raw": f"closed#{r['id']}"
+                        })
+
+            # D. 该植株的所有交接单出现记录（整体级）
+            if search_code:
+                c.execute("""SELECT h.* FROM shift_handovers h
+                    WHERE h.abnormal_plant_codes LIKE ? OR h.overdue_plant_codes LIKE ?
+                    ORDER BY h.handover_time DESC""",
+                          (f"%{search_code}%", f"%{search_code}%"))
+                for r in c.fetchall():
+                    events.append({
+                        "time": r["handover_time"] or "",
+                        "type": "交接班-整体清单",
+                        "level": "INFO",
+                        "content": (
+                            f"📦 {r['shift_no'] or ''} #{r['id']} 交接: {r['handover_from']}→{r['handover_to']} 确认:{r['confirmed']}\n"
+                            f"        → 原因: {(r['unfinished_reason'] or '-')[:120]}  备注: {(r['remarks'] or '-')[:120]}"
+                        ),
+                        "raw": f"handover#{r['id']}"
+                    })
+
+        # ---------- 步骤3：按时间倒序排序 ----------
+        def _sort_key(e):
+            t = (e.get("time") or "").strip().replace(" ", "0")[:19]
+            # 若时间为空则排最后
+            if not t or t == "0":
+                return "9999",
+            return t
+        events.sort(key=_sort_key, reverse=True)
+
+        # ---------- 总结结论 ----------
+        summary = {
+            "inspection_count": sum(1 for e in events if e["type"].startswith("巡检")),
+            "task_count": sum(1 for e in events if e["type"].startswith("任务") or e["type"] == "任务创建"),
+            "handover_count": sum(1 for e in events if "交接班" in e["type"]),
+            "reassign_count": sum(1 for e in events if e["type"] == "任务重指派"),
+            "closed_count": sum(1 for e in events if e["type"] == "闭环记录"),
+            "is_open_loop": any(e["level"] == "ERROR" or (e["type"] == "任务进行中") for e in events),
+        }
+
+        return {
+            "entity_type": entity_type,
+            "plant": plant_info,
+            "task": task_info,
+            "events_count": len(events),
+            "summary": summary,
+            "events": events,
+        }
