@@ -1021,13 +1021,42 @@ class Storage:
                 except Exception:
                     pass
 
-            # B. 遗留事项维度
-            c.execute("""SELECT id, item_type, original_assignee, current_assignee,
+            # B. 遗留事项维度（按区域过滤: 任务→tasks.area; 植株→plants.area）
+            c.execute("""SELECT id, item_type, ref_id, ref_code, original_assignee, current_assignee,
                 status, process_result, processed_by, processed_at, created_at
                 FROM shift_pending_items
                 WHERE created_at >= ? OR processed_at >= ? OR status != '已闭环'""",
                       (start_date + " 00:00:00", start_date + " 00:00:00"))
-            for r in c.fetchall():
+            pending_rows = c.fetchall()
+            # 预查 area 映射
+            task_area_cache, plant_area_cache = {}, {}
+            if area:
+                c2 = conn.cursor()
+                for r in pending_rows:
+                    if r["item_type"] == "任务" and r["ref_id"]:
+                        tid = r["ref_id"]
+                        if tid not in task_area_cache:
+                            c2.execute("SELECT area FROM tasks WHERE id = ?", (tid,))
+                            rr = c2.fetchone()
+                            task_area_cache[tid] = rr["area"] if rr else ""
+                    elif r["item_type"] in ("异常株", "逾期未检") and r["ref_code"]:
+                        code = r["ref_code"]
+                        if code not in plant_area_cache:
+                            c2.execute("SELECT area FROM plants WHERE code = ?", (code,))
+                            rr = c2.fetchone()
+                            plant_area_cache[code] = rr["area"] if rr else ""
+            for r in pending_rows:
+                # --- area过滤判断 ---
+                skip = False
+                if area:
+                    if r["item_type"] == "任务":
+                        t_area = task_area_cache.get(r["ref_id"], "")
+                        skip = (t_area != area)
+                    elif r["item_type"] in ("异常株", "逾期未检"):
+                        p_area = plant_area_cache.get(r["ref_code"], "")
+                        skip = (p_area != area)
+                if skip:
+                    continue
                 # B1: 被指派(接手)次数
                 u = r["current_assignee"] or ""
                 if u in perf:
@@ -1097,6 +1126,165 @@ class Storage:
             "period_label": f"{start_date} ~ {end_date}",
             "people_count": len(final),
             "people": final
+        }
+
+    # ==================== 班后复盘看板 (issue4_round3) ====================
+    def get_shift_review(self, start_date: str, end_date: str, area: str = "") -> Dict:
+        """
+        班后复盘：按班次把「逾期未检/异常株/遗留任务/重指派/闭环结果」串起来
+        标记跨班次遗留问题（同一 ref_code/ref_id 出现在多个交接单）
+        """
+        from collections import defaultdict
+        start_dt = start_date + " 00:00:00"
+        end_dt = end_date + " 23:59:59"
+
+        shifts = []
+        # 全局统计：某植株/任务出现过几次（跨班次）
+        entity_counter = defaultdict(list)  # key -> [shift_id,...]
+        all_pending_entities = []
+
+        with self._get_conn() as conn:
+            c = conn.cursor()
+            # 1. 先取区间内所有交接班（按 handover_time 升序）
+            c.execute(f"""
+                SELECT h.*, s.name AS shift_name, s.leader
+                FROM shift_handovers h
+                LEFT JOIN shifts s ON s.id = h.shift_id
+                WHERE h.handover_time BETWEEN ? AND ?
+                ORDER BY h.handover_time ASC, h.id ASC
+            """, (start_dt, end_dt))
+            handovers = [dict(r) for r in c.fetchall()]
+
+            for h in handovers:
+                # 展开遗留事项
+                items = self.get_handover_items(h["id"])
+                # ---- area过滤：基于items的区域归属判定 ----
+                if area:
+                    # 预查 area 映射
+                    filtered = []
+                    for it in items:
+                        keep = False
+                        if it["item_type"] == "任务" and it["ref_id"]:
+                            try:
+                                cc = conn.cursor()
+                                cc.execute("SELECT area FROM tasks WHERE id = ?", (it["ref_id"],))
+                                rr = cc.fetchone()
+                                if rr and rr["area"] == area:
+                                    keep = True
+                            except:
+                                pass
+                        elif it["ref_code"]:
+                            try:
+                                cc = conn.cursor()
+                                cc.execute("SELECT area FROM plants WHERE code = ?", (it["ref_code"],))
+                                rr = cc.fetchone()
+                                if rr and rr["area"] == area:
+                                    keep = True
+                            except:
+                                pass
+                        if keep:
+                            filtered.append(it)
+                    if not filtered:
+                        continue  # 该handover在本区域无任何匹配项，跳过
+                    items = filtered
+                    matched_area = area
+                else:
+                    matched_area = "-"
+                # 统计该班次KPI
+                ov = [i for i in items if i["item_type"] == "逾期未检"]
+                abn = [i for i in items if i["item_type"] == "异常株"]
+                tasks = [i for i in items if i["item_type"] == "任务"]
+                reassigned = [i for i in items if (i["current_assignee"] or "") != (i["original_assignee"] or "")
+                              and i["original_assignee"]]
+                closed = [i for i in items if (i["status"] or "") in ("已完成", "已闭环", "已处理")]
+                open_items = [i for i in items if i not in closed]
+
+                # 记录跨班次追踪
+                for it in items:
+                    key = None
+                    if it["item_type"] == "任务" and it["ref_id"]:
+                        key = ("TASK", it["ref_id"])
+                    elif it["item_type"] in ("异常株", "逾期未检") and it["ref_code"]:
+                        key = ("PLANT", it["ref_code"])
+                    if key:
+                        entity_counter[key].append(h["id"])
+                        all_pending_entities.append((key, it, h))
+
+                shifts.append({
+                    "shift_id": h["shift_id"],
+                    "shift_name": h.get("shift_name") or f"班次#{h['shift_id']}",
+                    "handover_id": h["id"],
+                    "shift_no": h.get("shift_no") or "",
+                    "leader": h.get("leader") or "",
+                    "handover_from": h["handover_from"],
+                    "handover_to": h["handover_to"],
+                    "handover_time": h["handover_time"],
+                    "area": matched_area,
+                    "confirmed": bool(h["confirmed"]),
+                    "overdue_count": len(ov),
+                    "abnormal_count": len(abn),
+                    "task_count": len(tasks),
+                    "total_pending": len(items),
+                    "reassigned_count": len(reassigned),
+                    "closed_count": len(closed),
+                    "open_count": len(open_items),
+                    "closed_rate": round(len(closed) / len(items) * 100, 1) if items else 0,
+                    "items_overdue": ov,
+                    "items_abnormal": abn,
+                    "items_tasks": tasks,
+                    "items_closed": closed,
+                    "items_reassigned": reassigned,
+                    "items": items,
+                })
+
+        # 统计跨班次的问题
+        cross_shift = []  # [{key, key_label, count, shifts:[shift_id...], statuses:[]}]
+        for key, shifts_list in entity_counter.items():
+            if len(shifts_list) >= 2:
+                related = [e for e in all_pending_entities if e[0] == key]
+                statuses = list({e[1].get("status") or "待处理" for e in related})
+                labels = {
+                    "TASK": f"任务#{key[1]}",
+                    "PLANT": f"植株{key[1]}",
+                }
+                final_status = "已闭环" if "已闭环" in statuses or "已完成" in statuses else (
+                    "处理中" if any(s in ("处理中", "进行中") for s in statuses) else "未闭环")
+                cross_shift.append({
+                    "key_type": key[0],
+                    "key_id": key[1],
+                    "key_label": labels.get(key[0], str(key)),
+                    "appear_in_shift_count": len(set(shifts_list)),
+                    "appear_in_shifts": sorted(set(shifts_list)),
+                    "all_statuses": statuses,
+                    "final_status": final_status,
+                    "related_events_count": len(related),
+                })
+        cross_shift.sort(key=lambda x: (-x["appear_in_shift_count"], x["key_label"]))
+
+        # 汇总KPI
+        total_pending = sum(s["total_pending"] for s in shifts)
+        total_closed = sum(s["closed_count"] for s in shifts)
+        total_reassigned = sum(s["reassigned_count"] for s in shifts)
+        overdue_total = sum(s["overdue_count"] for s in shifts)
+        abnormal_total = sum(s["abnormal_count"] for s in shifts)
+        cross_shift_unclosed = sum(1 for c in cross_shift if c["final_status"] == "未闭环")
+
+        return {
+            "start_date": start_date, "end_date": end_date,
+            "period_label": f"{start_date} ~ {end_date}",
+            "area": area or "全部区域",
+            "shifts_count": len(shifts),
+            "total_pending": total_pending,
+            "total_closed": total_closed,
+            "total_open": total_pending - total_closed,
+            "total_reassigned": total_reassigned,
+            "overdue_total": overdue_total,
+            "abnormal_total": abnormal_total,
+            "overall_closed_rate": round(total_closed / total_pending * 100, 1) if total_pending else 0,
+            "cross_shift_total": len(cross_shift),
+            "cross_shift_unclosed": cross_shift_unclosed,
+            "shifts": shifts,
+            "cross_shift_issues": cross_shift,
         }
 
     # ==================== 提醒看板 (issue4) ====================
@@ -1255,6 +1443,73 @@ class Storage:
         for t in due_tasks:
             p_count_t[t["priority_level"]] = p_count_t.get(t["priority_level"], 0) + 1
 
+        # ---- 排班建议 (issue2_round4) ----
+        # 1) 责任人负载判定：统计每人待处理任务数，>5 则判定"过载"
+        OVERLOAD_THRESHOLD = 5
+        assignee_load = defaultdict(lambda: {"tasks": 0, "checks_ref": 0, "urgent": 0})
+        for t in due_tasks:
+            u = t["task"].assignee or "未指派"
+            assignee_load[u]["tasks"] += 1
+            if t["priority_level"] in ("P0", "P1"):
+                assignee_load[u]["urgent"] += 1
+        # 待检植株按责任人（通过区域默认巡检人，这里估算：区域植株数 / 总人数，按区域分散）
+        area_inspector_hint = defaultdict(set)
+        for c in due_checks:
+            ar = c["plant"].area or "未分区域"
+            area_inspector_hint[ar].add(ar)
+        suggestions_by_assignee = {}
+        for u, ld in assignee_load.items():
+            tasks = ld["tasks"]
+            level = "🟢正常负载"
+            if tasks >= OVERLOAD_THRESHOLD:
+                level = "🔴过载(建议分流)"
+            elif tasks >= OVERLOAD_THRESHOLD - 1:
+                level = "🟡临界负载"
+            suggestions_by_assignee[u] = {
+                "user": u,
+                "task_count": tasks,
+                "urgent_count": ld["urgent"],
+                "load_level": level,
+                "overload": tasks >= OVERLOAD_THRESHOLD,
+                "suggestion": (
+                    f"⚠️ 建议将 {u} 的{min(2, tasks - OVERLOAD_THRESHOLD + 1)}条低优先级任务分流给其他同事"
+                    if tasks >= OVERLOAD_THRESHOLD
+                    else ("可适当增加任务" if tasks <= 1 else "负载合理")
+                ),
+            }
+
+        # 2) 区域合并巡检建议：同区域有 >= 3 株待检，建议一次巡检
+        MERGE_THRESHOLD = 3
+        suggestions_by_area = {}
+        for ar, ag in by_area.items():
+            check_cnt = len(ag["checks"])
+            task_cnt = len(ag["tasks"])
+            total = check_cnt + task_cnt
+            merge = check_cnt >= MERGE_THRESHOLD
+            suggestions_by_area[ar] = {
+                "area": ar,
+                "due_checks": check_cnt,
+                "due_tasks": task_cnt,
+                "total_work": total,
+                "merge_suggested": merge,
+                "reason": (
+                    f"同区域有{check_cnt}株待检，建议合并巡检，减少来回跑动"
+                    if merge else (
+                        f"建议与相邻区域一起处理，提高效率" if total else "暂无工作"
+                    )
+                ),
+            }
+
+        # 3) 给每条 due_check / due_task 打建议处理顺序 (基于优先级+区域+责任人)
+        order = 0
+        for c in due_checks:
+            order += 1
+            c["suggestion_order"] = order
+        order = 0
+        for t in due_tasks:
+            order += 1
+            t["suggestion_order"] = order
+
         return {
             "scope": scope, "scope_label": label,
             "start_date": start_str, "end_date": end_str,
@@ -1263,12 +1518,25 @@ class Storage:
             "by_area": by_area,
             "by_assignee": by_assignee,
             "priority_distribution": {"checks": p_count_c, "tasks": p_count_t},
+            "scheduling": {
+                "overload_threshold": OVERLOAD_THRESHOLD,
+                "merge_threshold": MERGE_THRESHOLD,
+                "suggestions_by_assignee": dict(sorted(
+                    suggestions_by_assignee.items(),
+                    key=lambda kv: (-kv[1]["task_count"], -kv[1]["urgent_count"])
+                )),
+                "suggestions_by_area": suggestions_by_area,
+                "overloaded_users": [u for u, v in suggestions_by_assignee.items() if v["overload"]],
+                "merge_areas": [a for a, v in suggestions_by_area.items() if v["merge_suggested"]],
+            },
             "summary": {
                 "checks_count": len(due_checks),
                 "checks_overdue": sum(1 for c in due_checks if c["is_overdue"]),
                 "tasks_count": len(due_tasks),
                 "tasks_overdue": sum(1 for t in due_tasks if t["days_left"] < 0),
                 "urgent_p0_p1": p_count_c["P0"] + p_count_c["P1"] + p_count_t["P0"] + p_count_t["P1"],
+                "overloaded_users_count": len([u for u, v in suggestions_by_assignee.items() if v["overload"]]),
+                "merge_areas_count": len([a for a, v in suggestions_by_area.items() if v["merge_suggested"]]),
             }
         }
 
@@ -1355,10 +1623,10 @@ class Storage:
                                 process_result = COALESCE(process_result,'') || ?,
                                 processed_by   = COALESCE(NULLIF(processed_by,''), ?),
                                 processed_at   = COALESCE(processed_at, ?)
-                            WHERE item_type = '任务' AND ref_code = ?
+                            WHERE item_type = '任务' AND (ref_code = ? OR ref_id = ?)
                               AND status NOT IN ('已完成','已闭环','已处理','已取消')""",
                                   (f"[导入{datetime.now().strftime('%Y-%m-%d %H:%M')}] {result or '批量导入完成'}; ",
-                                   processor or "批量导入", completed_at, tno))
+                                   processor or "批量导入", completed_at, tno, task_id))
             except Exception as e:
                 summary["failed"] += 1
                 summary["failed_list"].append({
@@ -1404,7 +1672,7 @@ class Storage:
                 c.execute("""INSERT INTO shift_pending_items
                     (handover_id, item_type, ref_id, ref_code, title, original_assignee, current_assignee, reason, status, created_at)
                     VALUES (?, '任务', ?, ?, ?, ?, ?, ?, '待处理', ?)""",
-                          (handover_id, tid, r["plant_code"] if r else "",
+                          (handover_id, tid, r["task_no"] if r else "",
                            f"{title} {desc}".strip(),
                            r["assignee"] if r else ho.handover_to,
                            r["assignee"] if r else ho.handover_to,

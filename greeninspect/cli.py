@@ -786,6 +786,7 @@ def report_cmd(
     area_view: bool = typer.Option(False, "--area-view", help="区域负责人视角:按区域+责任人+任务状态汇总"),
     kpi: bool = typer.Option(False, "--kpi", help="管理看板:巡检覆盖率/任务完成率/逾期风险/责任人排名(issue1)"),
     performance: bool = typer.Option(False, "--performance", help="负责人绩效考核:工作量/闭环率/处理时长/综合得分(issue2)"),
+    shift_review: bool = typer.Option(False, "--review", help="班后复盘:按班次串逾期/异常/遗留/重派/闭环,识别跨班次未闭环"),
     abnormal_view: bool = typer.Option(False, "--abnormal", help="连续多天异常植株和重复问题分析"),
     abnormal_days: int = typer.Option(7, "--abnormal-days", help="连续异常分析的时间窗口(天)"),
     min_occurrences: int = typer.Option(2, "--min-occur", help="最小异常天数才算连续"),
@@ -817,6 +818,12 @@ def report_cmd(
     # 负责人绩效考核
     if performance:
         _print_performance_dashboard(storage, df, dt, range_label, area)
+        return
+
+    # 班后复盘视图（issue1_round4）
+    if shift_review:
+        review = storage.get_shift_review(df, dt, area)
+        _print_shift_review(review, range_label)
         return
 
     # 区域负责人视角
@@ -1456,6 +1463,126 @@ def _print_performance_dashboard(storage: Storage, df: str, dt: str, range_label
                             title="💡 考核提示", border_style="magenta"))
 
 
+def _print_shift_review(review: Dict, range_label: str):
+    """班后复盘看板(issue1_round4): 按班次串逾期/异常/遗留/重派/闭环"""
+    from rich.table import Table
+    from rich import box
+
+    shifts = review["shifts"]
+    cross = review.get("cross_shift_issues", [])
+    if not shifts:
+        console.print(Panel(f"区间 [{range_label}] 内无交接班数据，请先运行 shift --create 和 shift --handover",
+                            title="📋 班后复盘", border_style="yellow"))
+        return
+
+    # 顶部汇总
+    rate = review["overall_closed_rate"]
+    rate_color = "green" if rate >= 80 else ("yellow" if rate >= 50 else "red")
+    cross_badge = ""
+    if review["cross_shift_unclosed"] > 0:
+        cross_badge = f"   [bold red]⚠️ 跨班次未闭环: {review['cross_shift_unclosed']}个[/bold red]"
+
+    console.print(Panel(
+        f"📅 复盘区间: [bold cyan]{range_label}[/bold cyan]   区域: [bold]{review.get('area','全部')}[/bold]\n"
+        f"🛠️ 交接班次: [bold]{review['shifts_count']}[/bold]   "
+        f"📋 遗留事项总数: [bold]{review['total_pending']}[/bold]\n"
+        f"✅ 已闭环: [bold green]{review['total_closed']}[/bold green]   "
+        f"⏳ 未闭环: [bold yellow]{review['total_open']}[/bold yellow]   "
+        f"🔁 重指派: [bold cyan]{review['total_reassigned']}[/bold cyan]\n"
+        f"📊 整体闭环率: [bold {rate_color}]{rate}%[/bold {rate_color}]   "
+        f"🔴 逾期植株: {review['overdue_total']}   🟠 异常株: {review['abnormal_total']}"
+        + cross_badge,
+        title=f"📋 班后复盘看板 ({review.get('area','全园区')})", border_style="bold blue"
+    ))
+
+    # ---- 每个班次的明细 ----
+    for s in shifts:
+        st = s["items_reassigned"]
+        shift_style = "green" if s["closed_rate"] >= 80 else ("yellow" if s["closed_rate"] >= 50 else "red")
+        # 标题1行（Panel.title 不能含 \n，避免 markup 解析错误）
+        head = (
+            f"🌙 {s['shift_name']} [dim](ID={s['shift_id']})[/dim]  "
+            f"🤝 {s['handover_from']}→{s['handover_to']}  "
+            f"🕒 {s['handover_time'][:16]}  区域: {s['area']}  "
+            f"📋 遗留{s['total_pending']}=🔴{s['overdue_count']}|🟠{s['abnormal_count']}|🔵{s['task_count']}  "
+            f"✅{s['closed_count']} ⏳{s['open_count']} 🔁{s['reassigned_count']}  "
+            f"[bold {shift_style}]闭环率: {s['closed_rate']}%[/bold {shift_style}]"
+        )
+        t = Table(show_header=True, header_style="bold", expand=True, box=box.ROUNDED)
+        t.add_column("类型", width=10, justify="center")
+        t.add_column("序号", width=4, justify="center")
+        t.add_column("事项摘要")
+        t.add_column("原→新责任人", width=16)
+        t.add_column("状态", width=10, justify="center")
+        t.add_column("闭环时间/备注", width=24)
+        for idx, it in enumerate(s["items"], 1):
+            tp = it["item_type"]
+            tp_badge = {"逾期未检": "[red]🔴逾期未检[/red]", "异常株": "[yellow]🟠异常株[/yellow]",
+                        "任务": "[blue]🔵遗留任务[/blue]"}.get(tp, tp)
+            status = it.get("status") or "待处理"
+            st_color = "green" if status in ("已完成", "已闭环", "已处理") else (
+                "yellow" if status in ("处理中",) else "cyan")
+            reassign_txt = ""
+            orig = it.get("original_assignee") or ""
+            curr = it.get("current_assignee") or ""
+            if orig and curr and orig != curr:
+                reassign_txt = f"[cyan]🔁 {orig}→{curr}[/cyan]"
+            elif curr:
+                reassign_txt = curr
+            note = it.get("process_result") or ""
+            if it.get("processed_at"):
+                note = f"@{it['processed_at'][:16]} {(note[:30] if note else '')}"
+            t.add_row(tp_badge, str(idx),
+                      (it.get("title") or "")[:60],
+                      reassign_txt,
+                      f"[{st_color}]{status}[/{st_color}]", note[:60])
+        console.print(Panel.fit(t, title=head, border_style="blue", padding=(0, 1)))
+
+    # ---- 跨班次遗留问题汇总 ----
+    if cross:
+        cross_t = Table(show_header=True, header_style="bold red", expand=True, box=box.ROUNDED)
+        cross_t.add_column("🔁 跨班次标记", justify="center")
+        cross_t.add_column("对象")
+        cross_t.add_column("出现次数", justify="center")
+        cross_t.add_column("出现在交接单ID")
+        cross_t.add_column("当前状态", justify="center")
+        cross_t.add_column("相关记录数", justify="center")
+
+        for c in cross:
+            count = c["appear_in_shift_count"]
+            hot = "🔥" * min(3, count - 1)
+            st = c["final_status"]
+            st_color = "green" if st == "已闭环" else ("yellow" if st == "处理中" else "red")
+            cross_t.add_row(
+                hot,
+                f"[bold]{c['key_label']}[/bold] [dim]({c['key_type']})[/dim]",
+                f"{count}个班次",
+                str(c["appear_in_shifts"]),
+                f"[{st_color}]{st}[/{st_color}]",
+                str(c["related_events_count"]),
+            )
+        console.print(Panel(
+            cross_t,
+            title=f"⚠️ 跨班次未闭环问题 (共{len(cross)}个, [red]未处理:{review['cross_shift_unclosed']}[/red])",
+            border_style="bold red", padding=(0, 1),
+        ))
+
+    # ---- 总结建议 ----
+    tips = []
+    if review["cross_shift_unclosed"] > 0:
+        tips.append(f"⚠️ 有{review['cross_shift_unclosed']}个问题跨了多个班次仍未闭环，请队长专项跟进")
+    if review["total_reassigned"] > review["total_pending"] * 0.3 and review["total_pending"] > 5:
+        tips.append("🔁 重指派比例偏高，请确认原责任人培训是否到位")
+    if review["overdue_total"] > 5:
+        tips.append(f"🔴 逾期植株{review['overdue_total']}株，建议安排明日专项巡检")
+    unclosed_shifts = sum(1 for s in shifts if s["open_count"] > 0)
+    if unclosed_shifts > 0:
+        tips.append(f"📋 {unclosed_shifts}个班次存在未闭环事项，请督促责任人及时补处理结果")
+    if tips:
+        console.print(Panel("\n".join(f"  • {t}" for t in tips),
+                            title="🎯 复盘建议", border_style="yellow"))
+
+
 # ============================================================
 # 提醒命令 Remind (issue4)
 # ============================================================
@@ -1570,6 +1697,49 @@ def remind_cmd(
                     tag = f"[red]⚠️{abs(dl)}天前到期[/red]" if dl < 0 else f"{dl}天后到期"
                     console.print(f"    • {p_emo}{p_lvl} {tag}  {tk.task_no} {tk.task_type} "
                                   f"[dim]({tk.area})[/dim] {tk.description[:30] if tk.description else ''}")
+
+    # ---- 排班建议 (issue2_round4) ----
+    sched = data.get("scheduling", {})
+    if sched:
+        sugs_as = sched.get("suggestions_by_assignee", {})
+        sugs_ar = sched.get("suggestions_by_area", {})
+        if sugs_as or sugs_ar:
+            lines = []
+            # 1. 责任人负载
+            overloads = sched.get("overloaded_users", [])
+            normal_count = sum(1 for v in sugs_as.values() if not v["overload"])
+            head_a = "👥 责任人负载分析:"
+            if overloads:
+                head_a += f"  [bold red]🔴 过载 {len(overloads)}人[/bold red] ({', '.join(overloads)})"
+            if normal_count:
+                head_a += f"  [green]🟢 正常 {normal_count}人[/green]"
+            lines.append(head_a)
+            if sugs_as:
+                for u, v in sugs_as.items():
+                    color = "red" if v["overload"] else ("yellow" if v["urgent_count"] >= 2 else "dim")
+                    lines.append(
+                        f"    {v['load_level']}  [{color}]{u}[/{color}]: 待处理{v['task_count']}项(紧急{v['urgent_count']})  "
+                        f"→ {v['suggestion']}"
+                    )
+            # 2. 区域合并巡检
+            merge_ars = sched.get("merge_areas", [])
+            if merge_ars:
+                lines.append(f"\n🗺️  区域合并巡检建议（同区域≥{sched.get('merge_threshold',3)}株待检，建议一次跑完）:")
+                for ar in merge_ars:
+                    v = sugs_ar.get(ar, {})
+                    lines.append(
+                        f"    🔵 [bold cyan]{ar}[/bold cyan]: 待检{v.get('due_checks',0)}株 + 任务{v.get('due_tasks',0)}项"
+                        f"  → {v.get('reason','')}"
+                    )
+            other = [a for a, v in sugs_ar.items() if not v.get('merge_suggested') and v.get('total_work', 0) > 0]
+            if other:
+                lines.append("\n  建议合并以下相邻小区域处理（降低来回跑动成本）:")
+                for ar in other[:6]:
+                    v = sugs_ar[ar]
+                    lines.append(f"    • [cyan]{ar}[/cyan]: 工作{v.get('total_work',0)}项  → {v.get('reason','')}")
+            console.print(Panel("\n".join(lines),
+                                title=f"📅 排班建议（过载阈值>{sched.get('overload_threshold',5)}项/人）",
+                                border_style="bold yellow", padding=(0, 1)))
 
     console.print(f"\n[dim]提示: 每天早上执行 [cyan]remind --scope 3days[/cyan] 生成今日优先清单；紧急按P0→P1→P2→P3处理[/dim]")
 
@@ -1696,11 +1866,9 @@ def export_cmd(
     sheets = {}
 
     if data_type in ("inspections", "all"):
-        insps = storage.get_inspections_by_area_and_date(area, date_from, date_to)
+        insps = storage.get_inspections_by_area_and_date(area, df, dt)
         rows = []
         for i in insps:
-            if area and i.area != area:
-                continue
             rows.append({
                 "巡检时间": i.check_date,
                 "植株编号": i.plant_code,
@@ -1715,7 +1883,9 @@ def export_cmd(
                 "需补苗": "是" if i.needs_replant else "否",
                 "备注": i.notes,
             })
-        sheets["巡检记录"] = pd.DataFrame(rows)
+        insp_df = pd.DataFrame(rows)
+        insp_df.attrs["date_range_label"] = range_label
+        sheets["巡检记录"] = insp_df
 
     if data_type in ("tasks", "all"):
         tasks = storage.get_tasks(status=status, area=area)
